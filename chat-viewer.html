@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
 <title>聊天记录查看器</title>
 <style>
 :root {
@@ -31,6 +31,9 @@
   --scrollbar-track: transparent;
   --drop-overlay: rgba(7,193,96,0.12);
   --badge-bg: #e0e0e0;
+  --danger: #e53935;
+  --select-bg: rgba(7,193,96,0.08);
+  --select-border: var(--accent);
 }
 
 [data-theme="dark"] {
@@ -59,6 +62,7 @@
   --scrollbar-track: #222;
   --drop-overlay: rgba(7,193,96,0.15);
   --badge-bg: #444;
+  --select-bg: rgba(7,193,96,0.15);
 }
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -70,6 +74,7 @@ body {
   height: 100vh;
   overflow: hidden;
   transition: background 0.3s, color 0.3s;
+  -webkit-tap-highlight-color: transparent;
 }
 
 /* Scrollbar */
@@ -162,6 +167,7 @@ body {
   flex: 1;
   overflow-y: auto;
   padding: 8px;
+  -webkit-overflow-scrolling: touch;
 }
 
 .conv-item {
@@ -329,6 +335,7 @@ body {
   padding: 16px;
   background: var(--bg-chat);
   position: relative;
+  -webkit-overflow-scrolling: touch;
 }
 
 /* Welcome Screen */
@@ -392,6 +399,7 @@ body {
   margin-bottom: 16px;
   max-width: 80%;
   animation: fadeIn 0.2s ease;
+  position: relative;
 }
 @keyframes fadeIn {
   from { opacity: 0; transform: translateY(8px); }
@@ -623,12 +631,79 @@ mark.search-hl.current {
 .modal-btn.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
 .modal-btn.primary:hover { background: var(--accent-hover); }
 
+/* Select Mode */
+.message.selectable { cursor: pointer; padding: 4px; border-radius: 12px; transition: background 0.15s; }
+.message.selectable:hover { background: var(--select-bg); }
+.message.selectable.selected { background: var(--select-bg); outline: 2px solid var(--select-border); }
+.msg-checkbox {
+  display: none; position: absolute; top: 50%; transform: translateY(-50%);
+  width: 22px; height: 22px; border-radius: 50%; border: 2px solid var(--border);
+  background: var(--bg-sidebar); align-items: center; justify-content: center; font-size: 12px; z-index: 2;
+}
+.message.user .msg-checkbox { right: -12px; }
+.message.assistant .msg-checkbox, .message.system .msg-checkbox { left: -12px; }
+.message.selectable .msg-checkbox { display: flex; }
+.message.selectable.selected .msg-checkbox { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+.select-toolbar {
+  display: none; align-items: center; gap: 8px; padding: 8px 16px;
+  background: var(--bg-sidebar); border-bottom: 1px solid var(--border);
+}
+.select-toolbar.visible { display: flex; }
+.select-toolbar .select-info { flex: 1; font-size: 14px; color: var(--text-secondary); }
+.select-toolbar button {
+  padding: 6px 14px; border-radius: 6px; border: 1px solid var(--border);
+  background: none; color: var(--text); cursor: pointer; font-size: 13px;
+}
+.select-toolbar .btn-export-sel { background: var(--accent); color: #fff; border-color: var(--accent); }
+.select-toolbar .btn-export-sel:disabled { opacity: 0.4; cursor: default; }
+
+/* Edit Mode */
+.msg-edit-area {
+  width: 100%; min-height: 80px; padding: 10px 14px; border: 2px solid var(--accent);
+  border-radius: 10px; background: var(--bg-sidebar); color: var(--text);
+  font-family: inherit; font-size: 14px; line-height: 1.7; resize: vertical; outline: none;
+}
+.msg-edit-actions { display: flex; gap: 6px; padding: 4px; justify-content: flex-end; }
+.msg-edit-actions button {
+  padding: 4px 12px; border-radius: 6px; border: 1px solid var(--border);
+  background: none; color: var(--text); cursor: pointer; font-size: 12px;
+}
+.msg-edit-actions .btn-save { background: var(--accent); color: #fff; border-color: var(--accent); }
+
+/* Welcome Button */
+.welcome-btn {
+  margin-top: 20px; padding: 12px 28px; background: var(--accent); color: #fff;
+  border: none; border-radius: 8px; font-size: 15px; cursor: pointer;
+}
+.welcome-btn:hover { background: var(--accent-hover); }
+
+/* Mobile Bottom Bar */
+.mobile-bottom-bar {
+  display: none; background: var(--bg-sidebar); border-top: 1px solid var(--border);
+  padding: 8px 16px; padding-bottom: calc(8px + env(safe-area-inset-bottom, 0));
+  justify-content: space-around; align-items: center;
+}
+.mobile-bottom-bar button {
+  background: none; border: none; color: var(--text); cursor: pointer; font-size: 20px;
+  padding: 8px 12px; border-radius: 8px; display: flex; flex-direction: column;
+  align-items: center; gap: 2px;
+}
+.mobile-bottom-bar button span { font-size: 10px; color: var(--text-secondary); }
+.mobile-bottom-bar button:active { background: var(--hover); }
+
 /* Responsive */
 @media (max-width: 768px) {
   .sidebar { width: 100%; min-width: 100%; position: absolute; z-index: 500; height: 100vh; }
   .sidebar.hidden { width: 0; min-width: 0; }
   .message { max-width: 90%; }
   .toggle-sidebar-btn { display: block !important; }
+  .mobile-bottom-bar { display: flex; }
+  .msg-actions { opacity: 1; }
+  .back-to-top { bottom: 80px; }
+  .toast { bottom: 130px; }
+  .search-bar { padding: 8px 10px; gap: 4px; }
+  .search-count { min-width: 60px; font-size: 11px; }
 }
 </style>
 </head>
@@ -669,6 +744,7 @@ mark.search-hl.current {
       </div>
       <div class="chat-header-actions">
         <button class="icon-btn" id="btnSearch" title="搜索 (Ctrl+F)">🔍</button>
+        <button class="icon-btn" id="btnSelectMode" title="选择消息">☑</button>
         <button class="icon-btn" id="btnFullscreen" title="全屏模式">⛶</button>
         <button class="icon-btn" id="btnExport" title="导出对话">📤</button>
       </div>
@@ -685,6 +761,15 @@ mark.search-hl.current {
       <button class="search-close" id="searchClose" title="关闭 (Esc)">×</button>
     </div>
 
+    <!-- Select Mode Toolbar -->
+    <div class="select-toolbar" id="selectToolbar">
+      <span class="select-info" id="selectInfo">已选 0 条消息</span>
+      <button onclick="selectAllMessages()">全选</button>
+      <button onclick="deselectAllMessages()">取消</button>
+      <button class="btn-export-sel" id="btnExportSelected" onclick="exportSelected()" disabled>导出所选</button>
+      <button onclick="exitSelectMode()">退出</button>
+    </div>
+
     <!-- Chat Body -->
     <div class="chat-body" id="chatBody">
       <div class="welcome" id="welcome">
@@ -696,9 +781,20 @@ mark.search-hl.current {
           <strong>快捷键：</strong><br>
           Ctrl+F 搜索 · Ctrl+D 切换主题<br>
           Enter/Shift+Enter 导航搜索结果<br>
-          Esc 关闭搜索
+          Esc 关闭搜索<br>
+          双击消息可编辑内容
         </p>
+        <button class="welcome-btn" id="btnWelcomeImport">点击导入文件</button>
       </div>
+    </div>
+
+    <!-- Mobile Bottom Bar -->
+    <div class="mobile-bottom-bar" id="mobileBar">
+      <button onclick="document.getElementById('sidebar').classList.remove('hidden')">📋<span>对话</span></button>
+      <button onclick="openSearch()">🔍<span>搜索</span></button>
+      <button onclick="toggleSelectMode()">☑<span>选择</span></button>
+      <button onclick="showExportModal()">📤<span>导出</span></button>
+      <button onclick="toggleTheme()">🌓<span>主题</span></button>
     </div>
   </div>
 </div>
@@ -741,7 +837,11 @@ let currentSort = 'default';
 let isDark = false;
 let searchMatches = [];
 let currentMatchIndex = -1;
-let originalMessages = [];
+let originalMessages = '';
+let isSelectMode = false;
+let selectedMsgIndices = new Set();
+let editingMsgIndex = -1;
+let exportMode = 'full';
 
 // ===== DOM =====
 const $ = id => document.getElementById(id);
@@ -758,6 +858,7 @@ const btnBackTop = $('btnBackTop');
 const toast = $('toast');
 const sidebarStats = $('sidebarStats');
 const fileInput = $('fileInput');
+const selectToolbar = $('selectToolbar');
 
 // ===== Theme =====
 $('btnTheme').addEventListener('click', toggleTheme);
@@ -769,6 +870,7 @@ function toggleTheme() {
 
 // ===== File Import =====
 $('btnImport').addEventListener('click', () => fileInput.click());
+$('btnWelcomeImport').addEventListener('click', () => fileInput.click());
 fileInput.addEventListener('change', e => {
   handleFiles(e.target.files);
   fileInput.value = '';
@@ -1008,13 +1110,20 @@ function loadConversation(index) {
   chatTitle.textContent = conv.title;
   welcome.style.display = 'none';
   clearSearch();
+  exitSelectMode();
+  editingMsgIndex = -1;
+  renderMessages();
+  renderConvList();
+  if (window.innerWidth <= 768) sidebar.classList.add('hidden');
+}
 
-  // Render messages
+function renderMessages() {
+  if (currentConvIndex < 0) return;
+  const conv = conversations[currentConvIndex];
   chatBody.innerHTML = '';
   let lastDate = '';
 
   conv.messages.forEach((msg, i) => {
-    // Date separator
     if (msg.time) {
       const dateStr = msg.time.toLocaleDateString('zh-CN');
       if (dateStr !== lastDate) {
@@ -1029,24 +1138,39 @@ function loadConversation(index) {
     const el = document.createElement('div');
     el.className = `message ${msg.role}`;
     el.dataset.index = i;
+    if (isSelectMode) {
+      el.classList.add('selectable');
+      if (selectedMsgIndices.has(i)) el.classList.add('selected');
+    }
 
     const avatar = msg.role === 'user' ? '👤' : (msg.role === 'assistant' ? '🤖' : 'ℹ️');
     const timeStr = msg.time ? formatTime(msg.time) : '';
+    const checkHtml = `<div class="msg-checkbox">${selectedMsgIndices.has(i) ? '✓' : ''}</div>`;
 
     let thinkingHtml = '';
     if (msg.thinking && msg.role === 'assistant') {
       thinkingHtml = `
         <div class="thinking-block">
-          <button class="thinking-toggle" onclick="toggleThinking(this)">
+          <button class="thinking-toggle" onclick="event.stopPropagation(); toggleThinking(this)">
             <span class="arrow">▶</span> 思考过程 (${msg.thinking.length} 字)
           </button>
           <div class="thinking-content">${escapeHtml(msg.thinking)}</div>
-        </div>
-      `;
+        </div>`;
     }
 
-    if (msg.role === 'system') {
+    if (editingMsgIndex === i) {
+      el.innerHTML = `
+        <div class="msg-avatar">${avatar}</div>
+        <div class="msg-content">
+          <textarea class="msg-edit-area" id="editArea">${escapeHtml(msg.text)}</textarea>
+          <div class="msg-edit-actions">
+            <button onclick="cancelEdit()">取消</button>
+            <button class="btn-save" onclick="saveEdit(${i})">保存</button>
+          </div>
+        </div>`;
+    } else if (msg.role === 'system') {
       el.innerHTML = `<div class="msg-content" style="width:100%"><div class="msg-bubble">${formatText(msg.text)}</div></div>`;
+      if (isSelectMode) el.innerHTML += checkHtml;
     } else {
       el.innerHTML = `
         <div class="msg-avatar">${avatar}</div>
@@ -1056,36 +1180,36 @@ function loadConversation(index) {
           <div style="display:flex;align-items:center;justify-content:space-between;">
             ${timeStr ? `<span class="msg-time">${timeStr}</span>` : '<span></span>'}
             <div class="msg-actions">
-              <button class="msg-action-btn" onclick="copyMessage(${index},${i})" title="复制">复制</button>
+              <button class="msg-action-btn" onclick="event.stopPropagation(); startEdit(${i})" title="编辑">编辑</button>
+              <button class="msg-action-btn" onclick="event.stopPropagation(); copyMessage(${i})" title="复制">复制</button>
+              <button class="msg-action-btn" onclick="event.stopPropagation(); deleteMessage(${i})" title="删除" style="color:var(--danger)">删除</button>
             </div>
           </div>
         </div>
-      `;
+        ${isSelectMode ? checkHtml : ''}`;
+    }
+
+    if (isSelectMode) {
+      el.addEventListener('click', e => {
+        if (e.target.closest('.msg-action-btn') || e.target.closest('.thinking-toggle') || e.target.closest('.msg-edit-area')) return;
+        toggleMessageSelect(i);
+      });
+    }
+    if (!isSelectMode) {
+      el.addEventListener('dblclick', e => {
+        if (e.target.closest('.msg-action-btn') || e.target.closest('.thinking-toggle')) return;
+        startEdit(i);
+      });
     }
 
     chatBody.appendChild(el);
   });
 
-  // Store original for search
   originalMessages = chatBody.innerHTML;
-
-  // Update sidebar active state
-  document.querySelectorAll('.conv-item').forEach((el, i) => {
-    const ri = conversations.indexOf(getSortedConvs()[i]);
-    el.classList.toggle('active', ri === index);
-  });
-  renderConvList();
-
-  // On mobile, hide sidebar after selecting
-  if (window.innerWidth <= 768) sidebar.classList.add('hidden');
-}
-
-function getSortedConvs() {
-  let sorted = [...conversations];
-  if (currentSort === 'messages') sorted.sort((a, b) => b.msgCount - a.msgCount);
-  else if (currentSort === 'chars') sorted.sort((a, b) => b.charCount - a.charCount);
-  else if (currentSort === 'time') sorted.sort((a, b) => (b.created || 0) - (a.created || 0));
-  return sorted;
+  if (editingMsgIndex >= 0) {
+    const area = $('editArea');
+    if (area) { area.focus(); area.setSelectionRange(area.value.length, area.value.length); }
+  }
 }
 
 // ===== Thinking Toggle =====
@@ -1097,9 +1221,93 @@ function toggleThinking(btn) {
 }
 
 // ===== Copy Message =====
-function copyMessage(convIdx, msgIdx) {
-  const msg = conversations[convIdx].messages[msgIdx];
+function copyMessage(msgIdx) {
+  const msg = conversations[currentConvIndex].messages[msgIdx];
   navigator.clipboard.writeText(msg.text).then(() => showToast('已复制'));
+}
+
+// ===== Edit Message =====
+function startEdit(msgIdx) {
+  editingMsgIndex = msgIdx;
+  renderMessages();
+}
+function cancelEdit() {
+  editingMsgIndex = -1;
+  renderMessages();
+}
+function saveEdit(msgIdx) {
+  const area = $('editArea');
+  if (!area) return;
+  const conv = conversations[currentConvIndex];
+  conv.messages[msgIdx].text = area.value;
+  conv.charCount = conv.messages.reduce((s, m) => s + (m.text || '').length + (m.thinking || '').length, 0);
+  editingMsgIndex = -1;
+  renderMessages();
+  renderConvList();
+  showToast('消息已更新');
+}
+function deleteMessage(msgIdx) {
+  if (!confirm('确定删除这条消息？')) return;
+  const conv = conversations[currentConvIndex];
+  conv.messages.splice(msgIdx, 1);
+  conv.msgCount = conv.messages.length;
+  conv.charCount = conv.messages.reduce((s, m) => s + (m.text || '').length + (m.thinking || '').length, 0);
+  if (editingMsgIndex === msgIdx) editingMsgIndex = -1;
+  selectedMsgIndices.delete(msgIdx);
+  const newSet = new Set();
+  selectedMsgIndices.forEach(idx => { if (idx < msgIdx) newSet.add(idx); else if (idx > msgIdx) newSet.add(idx - 1); });
+  selectedMsgIndices = newSet;
+  renderMessages();
+  renderConvList();
+  updateSelectInfo();
+  showToast('消息已删除');
+}
+
+// ===== Select Mode =====
+$('btnSelectMode').addEventListener('click', toggleSelectMode);
+function toggleSelectMode() {
+  if (currentConvIndex < 0) { showToast('请先选择一个对话'); return; }
+  isSelectMode = !isSelectMode;
+  if (isSelectMode) {
+    selectedMsgIndices.clear();
+    selectToolbar.classList.add('visible');
+    $('btnSelectMode').classList.add('active');
+  } else { exitSelectMode(); }
+  renderMessages();
+  updateSelectInfo();
+}
+function exitSelectMode() {
+  isSelectMode = false;
+  selectedMsgIndices.clear();
+  selectToolbar.classList.remove('visible');
+  if ($('btnSelectMode')) $('btnSelectMode').classList.remove('active');
+  if (currentConvIndex >= 0) renderMessages();
+}
+function toggleMessageSelect(idx) {
+  if (selectedMsgIndices.has(idx)) selectedMsgIndices.delete(idx);
+  else selectedMsgIndices.add(idx);
+  renderMessages();
+  updateSelectInfo();
+}
+function selectAllMessages() {
+  if (currentConvIndex < 0) return;
+  for (let i = 0; i < conversations[currentConvIndex].messages.length; i++) selectedMsgIndices.add(i);
+  renderMessages();
+  updateSelectInfo();
+}
+function deselectAllMessages() {
+  selectedMsgIndices.clear();
+  renderMessages();
+  updateSelectInfo();
+}
+function updateSelectInfo() {
+  $('selectInfo').textContent = `已选 ${selectedMsgIndices.size} 条消息`;
+  $('btnExportSelected').disabled = selectedMsgIndices.size === 0;
+}
+function exportSelected() {
+  if (selectedMsgIndices.size === 0) { showToast('请先选择消息'); return; }
+  exportMode = 'selected';
+  $('exportModal').classList.add('visible');
 }
 
 // ===== Text Formatting =====
@@ -1297,21 +1505,30 @@ btnBackTop.addEventListener('click', () => {
 });
 
 // ===== Export =====
-$('btnExport').addEventListener('click', () => {
+$('btnExport').addEventListener('click', showExportModal);
+function showExportModal() {
   if (currentConvIndex < 0) { showToast('请先选择一个对话'); return; }
+  exportMode = 'full';
   $('exportModal').classList.add('visible');
-});
+}
 
 function closeExportModal() { $('exportModal').classList.remove('visible'); }
 
 function doExport(format) {
   closeExportModal();
   const conv = conversations[currentConvIndex];
+  let msgs;
+  if (exportMode === 'selected' && selectedMsgIndices.size > 0) {
+    msgs = [...selectedMsgIndices].sort((a,b) => a-b).map(i => conv.messages[i]);
+  } else {
+    msgs = conv.messages;
+  }
+  const titleSuffix = exportMode === 'selected' ? ' (部分)' : '';
   let content = '';
 
   if (format === 'md') {
-    content = `# ${conv.title}\n\n`;
-    conv.messages.forEach(msg => {
+    content = `# ${conv.title}${titleSuffix}\n\n`;
+    msgs.forEach(msg => {
       const role = msg.role === 'user' ? '**用户**' : (msg.role === 'assistant' ? '**AI**' : '**系统**');
       const time = msg.time ? ` (${formatTime(msg.time)})` : '';
       content += `### ${role}${time}\n\n${msg.text}\n\n`;
@@ -1319,8 +1536,8 @@ function doExport(format) {
       content += '---\n\n';
     });
   } else {
-    content = `${conv.title}\n${'='.repeat(40)}\n\n`;
-    conv.messages.forEach(msg => {
+    content = `${conv.title}${titleSuffix}\n${'='.repeat(40)}\n\n`;
+    msgs.forEach(msg => {
       const role = msg.role === 'user' ? '[用户]' : (msg.role === 'assistant' ? '[AI]' : '[系统]');
       const time = msg.time ? ` (${formatTime(msg.time)})` : '';
       content += `${role}${time}\n${msg.text}\n\n`;
@@ -1333,10 +1550,10 @@ function doExport(format) {
   const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
-  a.download = `${conv.title}.${ext}`;
+  a.download = `${conv.title}${titleSuffix}.${ext}`;
   a.click();
   URL.revokeObjectURL(a.href);
-  showToast('导出成功');
+  showToast(`已导出 ${msgs.length} 条消息`);
 }
 
 // ===== Keyboard Shortcuts =====
@@ -1351,12 +1568,43 @@ document.addEventListener('keydown', e => {
     e.preventDefault();
     toggleTheme();
   }
-  // Esc: Close search
+  // Esc: Close search / exit select / cancel edit
   if (e.key === 'Escape') {
     if (searchBar.classList.contains('visible')) closeSearch();
-    if ($('exportModal').classList.contains('visible')) closeExportModal();
+    else if ($('exportModal').classList.contains('visible')) closeExportModal();
+    else if (isSelectMode) exitSelectMode();
+    else if (editingMsgIndex >= 0) cancelEdit();
   }
 });
+
+// ===== Mobile: Long press to edit =====
+let longPressTimer = null;
+chatBody.addEventListener('touchstart', e => {
+  if (isSelectMode) return;
+  const msgEl = e.target.closest('.message');
+  if (!msgEl || e.target.closest('.msg-action-btn') || e.target.closest('.thinking-toggle')) return;
+  longPressTimer = setTimeout(() => {
+    const idx = parseInt(msgEl.dataset.index);
+    if (!isNaN(idx)) startEdit(idx);
+  }, 600);
+}, { passive: true });
+chatBody.addEventListener('touchend', () => clearTimeout(longPressTimer), { passive: true });
+chatBody.addEventListener('touchmove', () => clearTimeout(longPressTimer), { passive: true });
+
+// ===== Mobile: Swipe for sidebar =====
+let touchStartX = 0, touchStartY = 0;
+document.addEventListener('touchstart', e => {
+  touchStartX = e.touches[0].clientX;
+  touchStartY = e.touches[0].clientY;
+}, { passive: true });
+document.addEventListener('touchend', e => {
+  const dx = e.changedTouches[0].clientX - touchStartX;
+  const dy = Math.abs(e.changedTouches[0].clientY - touchStartY);
+  if (touchStartX < 30 && dx > 80 && dy < 60 && sidebar.classList.contains('hidden'))
+    sidebar.classList.remove('hidden');
+  if (dx < -80 && dy < 60 && window.innerWidth <= 768 && !sidebar.classList.contains('hidden'))
+    sidebar.classList.add('hidden');
+}, { passive: true });
 
 // ===== Helpers =====
 function formatDate(d) {
