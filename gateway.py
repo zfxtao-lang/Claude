@@ -30,13 +30,14 @@ from config import (
     GATEWAY_AUTH_TOKEN,
     HISTORY_SEARCH_LIMIT,
     MAX_HISTORY_CHARS,
+    MAX_NOTION_CHARS,
     PROVIDERS,
     RATE_LIMIT_RPD,
     RATE_LIMIT_RPM,
     get_provider_for_model,
     load_system_prompt,
 )
-from database import backup_database, init_db, save_message, search_history
+from database import backup_database, init_db, save_message, search_history, start_writer
 from notion_cache import get_notion_content, invalidate_cache
 
 # ---------- App Setup ----------
@@ -48,6 +49,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 init_db()
+start_writer()  # Start async DB write thread
 
 # ---------- Rate Limiter (in-memory, simple) ----------
 _rate_store: dict[str, list[float]] = defaultdict(list)
@@ -300,14 +302,23 @@ def build_messages(incoming_messages: list[dict], model: str) -> list[dict]:
     # Filter out Kelivo junk
     cleaned = filter_kelivo_messages(incoming_messages)
 
-    # Build system message (our prompt + Notion knowledge base)
-    system_text = system_prompt
-    if notion_content:
-        system_text += f"\n\n--- Knowledge Base ---\n{notion_content}"
-
+    # Prompt structure per plan:
+    #   1. system(persona) - first, purest, highest weight
+    #   2. system(Notion core memory) - separate, truncated
+    #   3. user messages from Kelivo
+    #   4. history context injected as user message
     final_messages = []
-    if system_text:
-        final_messages.append({"role": "system", "content": system_text})
+    if system_prompt:
+        final_messages.append({"role": "system", "content": system_prompt})
+    if notion_content:
+        # Truncate Notion content to budget
+        truncated_notion = notion_content[:MAX_NOTION_CHARS]
+        if len(notion_content) > MAX_NOTION_CHARS:
+            truncated_notion += "\n...(truncated)"
+        final_messages.append({
+            "role": "system",
+            "content": f"[Core Memory from Knowledge Base]\n{truncated_notion}",
+        })
 
     # Add cleaned Kelivo messages (skip any system messages from Kelivo)
     for msg in cleaned:
@@ -352,11 +363,13 @@ def chat_completions():
     if request.method == "OPTIONS":
         return "", 204
 
-    # Rate limit
-    allowed, err_msg = _check_rate_limit()
+    # Rate limit (per-IP)
+    client_ip = request.headers.get("X-Forwarded-For", request.remote_addr) or "unknown"
+    client_ip = client_ip.split(",")[0].strip()  # first IP if behind proxy
+    allowed, err_msg = _check_rate_limit(client_ip)
     if not allowed:
         return jsonify({"error": {"message": err_msg, "type": "rate_limit_error"}}), 429
-    _rate_store["global"].append(time.time())
+    _rate_store[client_ip].append(time.time())
 
     data = request.get_json(force=True)
     model = data.get("model", "gpt-4o")

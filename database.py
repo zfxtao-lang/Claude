@@ -1,17 +1,29 @@
 """
 SQLite database layer - WAL mode, FTS5 with jieba, backup, dedup
+Uses a background thread for writes to avoid blocking the main request thread.
 """
+import atexit
 import json
+import logging
 import os
+import queue
 import re
 import shutil
 import sqlite3
+import threading
 import time
 from datetime import datetime, timedelta
 
 import jieba
 
 from config import DB_PATH, DB_BACKUP_DIR, DB_BACKUP_KEEP_DAYS
+
+logger = logging.getLogger(__name__)
+
+# ---------- Async Write Queue ----------
+_write_queue: queue.Queue = queue.Queue()
+_writer_thread: threading.Thread | None = None
+_stop_event = threading.Event()
 
 
 def jieba_tokenize(text: str) -> str:
@@ -83,10 +95,58 @@ def init_db():
     conn.close()
 
 
+def _write_worker():
+    """Background thread: consume write queue and persist to SQLite."""
+    while not _stop_event.is_set():
+        try:
+            task = _write_queue.get(timeout=1.0)
+        except queue.Empty:
+            continue
+        try:
+            _do_save_message(**task)
+        except Exception as e:
+            logger.error(f"DB write failed: {e}")
+        finally:
+            _write_queue.task_done()
+
+
+def start_writer():
+    """Start the background writer thread."""
+    global _writer_thread
+    if _writer_thread is None or not _writer_thread.is_alive():
+        _writer_thread = threading.Thread(target=_write_worker, daemon=True)
+        _writer_thread.start()
+
+
+def stop_writer():
+    """Gracefully stop the writer thread and flush remaining items."""
+    _stop_event.set()
+    if _writer_thread:
+        _writer_thread.join(timeout=10)
+
+
+atexit.register(stop_writer)
+
+
 def save_message(conversation_id: str, role: str, content: str,
                  model: str = "", provider: str = "",
                  tokens_in: int = 0, tokens_out: int = 0):
-    """Save a single message (latest user + assistant only, not Kelivo history)."""
+    """Enqueue a message for async writing (non-blocking)."""
+    _write_queue.put({
+        "conversation_id": conversation_id,
+        "role": role,
+        "content": content,
+        "model": model,
+        "provider": provider,
+        "tokens_in": tokens_in,
+        "tokens_out": tokens_out,
+    })
+
+
+def _do_save_message(conversation_id: str, role: str, content: str,
+                     model: str = "", provider: str = "",
+                     tokens_in: int = 0, tokens_out: int = 0):
+    """Actually persist a message to SQLite (called from writer thread)."""
     conn = get_db()
     try:
         # Ensure conversation exists

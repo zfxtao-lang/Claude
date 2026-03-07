@@ -3,6 +3,10 @@ Gateway configuration - multi-provider routing, timeout, rate limiting
 """
 import os
 
+from dotenv import load_dotenv
+
+load_dotenv()  # Load .env file
+
 # ---------- API Providers ----------
 # Each provider: name -> {base_url, api_key, models[], timeout}
 PROVIDERS = {
@@ -52,6 +56,9 @@ RATE_LIMIT_RPD = int(os.getenv("RATE_LIMIT_RPD", "500"))      # requests per day
 
 # ---------- CORS ----------
 CORS_ALLOWED_ORIGINS = os.getenv("CORS_ALLOWED_ORIGINS", "*").split(",")
+
+# ---------- Token Budget ----------
+MAX_NOTION_CHARS = int(os.getenv("MAX_NOTION_CHARS", "6000"))  # truncate Notion content
 
 # ---------- Retry ----------
 API_MAX_RETRIES = int(os.getenv("API_MAX_RETRIES", "2"))
