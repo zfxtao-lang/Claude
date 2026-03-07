@@ -1,0 +1,18 @@
+[Unit]
+Description=AI Chat Gateway
+After=network.target
+
+[Service]
+Type=notify
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/gateway
+Environment="PATH=/opt/gateway/venv/bin:/usr/local/bin:/usr/bin"
+EnvironmentFile=/opt/gateway/.env
+ExecStart=/opt/gateway/venv/bin/gunicorn -c gunicorn.conf.py gateway:app
+ExecReload=/bin/kill -s HUP $MAINPID
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
