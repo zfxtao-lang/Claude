@@ -633,6 +633,9 @@ def chat_completions():
         def generate():
             assistant_text = []
             try:
+                # Force UTF-8 decoding — OpenRouter may not set charset in headers,
+                # causing requests to default to latin-1 and garble Chinese text
+                resp.encoding = "utf-8"
                 for line in resp.iter_lines(decode_unicode=True):
                     if not line:
                         continue
@@ -658,11 +661,13 @@ def chat_completions():
 
         return Response(
             stream_with_context(generate()),
-            content_type="text/event-stream",
+            content_type="text/event-stream; charset=utf-8",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
     # ---------- Non-streaming response ----------
+    # Force UTF-8 before parsing JSON — same OpenRouter encoding issue
+    resp.encoding = "utf-8"
     raw_json = resp.json()
     logger.info(f"Raw API response keys: {list(raw_json.keys())}")
     result = raw_json
