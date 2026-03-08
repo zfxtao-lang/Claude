@@ -346,53 +346,101 @@ def _do_save_message(conversation_id: str, role: str, content: str,
         conn.close()
 
 
+def _build_like_conditions(keywords: list[str], column: str = "content") -> tuple[str, list[str]]:
+    """
+    Build a WHERE clause that requires ALL keywords to appear (AND logic).
+    Returns (sql_fragment, params).
+    E.g. keywords=["机器","学习"] -> "content LIKE ? AND content LIKE ?", ["%机器%", "%学习%"]
+    """
+    if not keywords:
+        return "1=1", []
+    clauses = [f"{column} LIKE ?" for _ in keywords]
+    params = [f"%{kw}%" for kw in keywords]
+    return " AND ".join(clauses), params
+
+
 def search_history(query: str, limit: int = 5, max_chars: int = 4000) -> list[dict]:
-    """Search message history using LIKE (fallback) + FTS5 jieba."""
+    """
+    Search message history.
+    Priority: jieba tokenized multi-keyword LIKE (works for Chinese),
+    then FTS5 as fallback (works for English/indexed content).
+    """
     conn = get_db()
     results = []
+    seen = set()
+
+    def _add_rows(rows):
+        for row in rows:
+            d = dict(row)
+            key = (d["conversation_id"], d["created_at"])
+            if key not in seen:
+                seen.add(key)
+                results.append(d)
+
     try:
-        # FTS5 search with jieba tokenization
-        tokenized_query = jieba_tokenize(query)
-        safe_fts_query = _sanitize_fts5_query(tokenized_query) if tokenized_query else ""
-        if safe_fts_query:
-            try:
-                fts_rows = conn.execute(
-                    """SELECT m.role, m.content, m.created_at, m.conversation_id
-                       FROM messages_fts f
-                       JOIN messages m ON m.conversation_id = f.conversation_id
-                            AND m.content LIKE '%' || ? || '%'
-                       WHERE messages_fts MATCH ?
-                       ORDER BY m.created_at DESC
-                       LIMIT ?""",
-                    (query[:20], safe_fts_query, limit)
-                ).fetchall()
-            except Exception:
-                # If FTS still fails (corrupt index, etc.), fall through to LIKE
-                logger.warning("FTS5 query failed, falling back to LIKE", exc_info=True)
-                fts_rows = []
-            for row in fts_rows:
-                results.append(dict(row))
+        # --- Phase 1: jieba-tokenized multi-keyword LIKE (Chinese-friendly) ---
+        keywords = [w for w in jieba_tokenize(query).split() if len(w) >= 1]
+        # Always include the original query as a keyword for exact-phrase matching
+        all_keywords = list(dict.fromkeys([query] + keywords))  # dedup, preserve order
 
-        # Fallback: LIKE search if FTS didn't find enough
-        if len(results) < limit:
-            like_rows = conn.execute(
+        if all_keywords:
+            # First try exact query match
+            exact_rows = conn.execute(
                 """SELECT role, content, created_at, conversation_id
-                   FROM messages
-                   WHERE content LIKE ?
-                   ORDER BY created_at DESC
-                   LIMIT ?""",
-                (f"%{query}%", limit - len(results))
+                   FROM messages WHERE content LIKE ?
+                   ORDER BY created_at DESC LIMIT ?""",
+                (f"%{query}%", limit)
             ).fetchall()
-            seen = {(r["conversation_id"], r["created_at"]) for r in results}
-            for row in like_rows:
-                d = dict(row)
-                if (d["conversation_id"], d["created_at"]) not in seen:
-                    results.append(d)
+            _add_rows(exact_rows)
 
-        # Also search legacy chat_history_backup if it still exists and we need more
+            # Then try multi-keyword AND match (jieba tokens)
+            if len(results) < limit and len(keywords) > 1:
+                where_sql, params = _build_like_conditions(keywords)
+                kw_rows = conn.execute(
+                    f"""SELECT role, content, created_at, conversation_id
+                        FROM messages WHERE {where_sql}
+                        ORDER BY created_at DESC LIMIT ?""",
+                    params + [limit - len(results)]
+                ).fetchall()
+                _add_rows(kw_rows)
+
+            # Then try individual keywords (broader recall)
+            if len(results) < limit and len(keywords) > 1:
+                for kw in keywords:
+                    if len(results) >= limit:
+                        break
+                    if len(kw) < 2:
+                        continue  # skip single-char tokens for noise reduction
+                    single_rows = conn.execute(
+                        """SELECT role, content, created_at, conversation_id
+                           FROM messages WHERE content LIKE ?
+                           ORDER BY created_at DESC LIMIT ?""",
+                        (f"%{kw}%", limit - len(results))
+                    ).fetchall()
+                    _add_rows(single_rows)
+
+        # --- Phase 2: FTS5 fallback (useful for English / already-indexed content) ---
+        if len(results) < limit:
+            tokenized_query = jieba_tokenize(query)
+            safe_fts_query = _sanitize_fts5_query(tokenized_query) if tokenized_query else ""
+            if safe_fts_query:
+                try:
+                    fts_rows = conn.execute(
+                        """SELECT m.role, m.content, m.created_at, m.conversation_id
+                           FROM messages_fts f
+                           JOIN messages m ON m.conversation_id = f.conversation_id
+                           WHERE messages_fts MATCH ?
+                           ORDER BY m.created_at DESC
+                           LIMIT ?""",
+                        (safe_fts_query, limit - len(results))
+                    ).fetchall()
+                    _add_rows(fts_rows)
+                except Exception:
+                    logger.warning("FTS5 query failed", exc_info=True)
+
+        # --- Phase 3: legacy backup table ---
         if len(results) < limit and _table_exists(conn, "chat_history_backup"):
             try:
-                # Detect content column name in backup table
                 backup_cols = _get_table_columns(conn, "chat_history_backup")
                 c_col = "content" if "content" in backup_cols else (
                     "message" if "message" in backup_cols else None)
@@ -411,8 +459,7 @@ def search_history(query: str, limit: int = 5, max_chars: int = 4000) -> list[di
                     legacy_rows = conn.execute(
                         legacy_sql, (f"%{query}%", limit - len(results))
                     ).fetchall()
-                    for row in legacy_rows:
-                        results.append(dict(row))
+                    _add_rows(legacy_rows)
             except Exception as e:
                 logger.debug(f"Legacy search failed (ok to ignore): {e}")
 
