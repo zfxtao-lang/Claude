@@ -376,10 +376,10 @@ def build_messages(incoming_messages: list[dict], model: str) -> list[dict]:
                 + "\n".join(memory_lines)
             )
             final_messages.append({
-                "role": "system",
+                "role": "user",
                 "content": memory_text,
             })
-            logger.info(f"[Memory] injected at position {memory_inject_idx} "
+            logger.info(f"[Memory] injected as user msg at position {memory_inject_idx} "
                         f"(before Kelivo messages), {len(memory_lines)} memory lines")
     else:
         logger.info("[Memory] no search_query extracted, skipping memory retrieval")
