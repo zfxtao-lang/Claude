@@ -23,7 +23,8 @@ logging.basicConfig(
 from database import init_db, search_history, jieba_tokenize
 
 # Import gateway functions — this also initializes Flask app, but we won't run it
-from gateway import extract_search_query, build_messages
+from gateway import extract_search_query, build_messages, vector_search_memories
+from embedding import vector_store
 
 
 BLUE = "\033[34m"
@@ -92,8 +93,29 @@ def main():
     print(f"  Original: '{args.question}'")
     print(f"  Tokens:   [{', '.join(tokens.split())}]")
 
-    # --- Step 4: Search database ---
-    print(f"\n{YELLOW}▸ Step 3: search_history{RESET}")
+    # --- Step 4: Vector search ---
+    print(f"\n{YELLOW}▸ Step 3a: vector search (semantic){RESET}")
+    print(f"  Vector store size: {vector_store.size}")
+    if vector_store.size > 0:
+        vec_results = vector_search_memories(search_query, top_k=args.limit)
+        print(f"  {BOLD}Results: {len(vec_results)}{RESET}")
+        for i, vc in enumerate(vec_results):
+            score = vc.get("score", 0)
+            date = vc.get("created_at", "?")[:10]
+            content = vc.get("content", "")
+            color = GREEN if score >= 0.5 else YELLOW
+            if args.full:
+                print(f"\n  [{i}] {color}score={score:.3f}{RESET} | {date}")
+                for line in content.split("\n"):
+                    print(f"       {line}")
+            else:
+                print(f"  [{i}] {color}score={score:.3f}{RESET} | {date} | "
+                      f"{truncate(content, 100)}")
+    else:
+        print(f"  {DIM}(no vectors yet — run POST /admin/vectors/rebuild first){RESET}")
+
+    # --- Step 5: LIKE search (keyword fallback) ---
+    print(f"\n{YELLOW}▸ Step 3b: LIKE search (keyword fallback){RESET}")
     print(f"  query='{search_query[:60]}', limit={args.limit}, exclude_recent={args.exclude}")
     results = search_history(search_query, limit=args.limit, exclude_recent=args.exclude)
     print(f"  {BOLD}Results: {len(results)}{RESET}")

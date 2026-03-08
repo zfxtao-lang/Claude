@@ -16,6 +16,7 @@ Fixes applied:
 import json
 import logging
 import re
+import threading
 import time
 import uuid
 from collections import defaultdict
@@ -40,7 +41,13 @@ from config import (
     load_system_prompt,
     reload_providers,
 )
-from database import backup_database, init_db, save_message, search_history, start_writer
+from database import (
+    backup_database, build_pending_chunks, get_chunks_by_ids, get_unembedded_chunks,
+    init_db, mark_chunks_embedded, save_message, search_history, start_writer,
+)
+from embedding import (
+    get_embedding, get_embeddings_batch, vector_store,
+)
 from notion_cache import get_notion_content, invalidate_cache
 
 # ---------- App Setup ----------
@@ -53,6 +60,82 @@ logger = logging.getLogger(__name__)
 
 init_db()
 start_writer()  # Start async DB write thread
+
+
+# ---------- Background Embedding Worker ----------
+def _embedding_worker():
+    """Background thread: chunk new messages → embed → store vectors."""
+    import time as _time
+    logger.info("[Vector] background embedding worker started")
+    while True:
+        try:
+            # 1. Create chunks from new messages
+            new_chunks = build_pending_chunks()
+
+            # 2. Embed un-embedded chunks
+            pending = get_unembedded_chunks(limit=30)
+            if pending:
+                texts = [c["content"] for c in pending]
+                vectors = get_embeddings_batch(texts)
+
+                embedded_ids = []
+                for chunk, vec in zip(pending, vectors):
+                    if vec is not None:
+                        vector_store.add(chunk["id"], vec)
+                        embedded_ids.append(chunk["id"])
+
+                if embedded_ids:
+                    mark_chunks_embedded(embedded_ids)
+                    vector_store.save()
+                    logger.info(f"[Vector] embedded {len(embedded_ids)} chunks, "
+                                f"store size: {vector_store.size}")
+
+        except Exception:
+            logger.error("[Vector] embedding worker error", exc_info=True)
+
+        _time.sleep(60)  # run every 60 seconds
+
+
+_embedding_thread = threading.Thread(target=_embedding_worker, daemon=True)
+_embedding_thread.start()
+
+
+# ---------- Vector Search ----------
+def vector_search_memories(query: str, top_k: int = 5,
+                           min_score: float = 0.3) -> list[dict]:
+    """
+    Search memories using vector similarity.
+    Returns list of chunk dicts with content, sorted by relevance.
+    """
+    if vector_store.size == 0:
+        logger.info("[Vector] store empty, skipping vector search")
+        return []
+
+    query_vec = get_embedding(query)
+    if query_vec is None:
+        logger.warning("[Vector] failed to embed query, skipping vector search")
+        return []
+
+    results = vector_store.search(query_vec, top_k=top_k)
+    # Filter by minimum score
+    good_results = [(cid, score) for cid, score in results if score >= min_score]
+
+    if not good_results:
+        logger.info(f"[Vector] no results above min_score={min_score} "
+                    f"(best: {results[0][1]:.3f} if any)")
+        return []
+
+    chunk_ids = [cid for cid, _ in good_results]
+    scores = {cid: score for cid, score in good_results}
+    chunks = get_chunks_by_ids(chunk_ids)
+
+    for c in chunks:
+        c["score"] = scores.get(c["id"], 0)
+
+    logger.info(f"[Vector] found {len(chunks)} chunks, "
+                f"scores: {[f'{s:.3f}' for _, s in good_results]}")
+    return chunks
+
 
 # ---------- Rate Limiter (in-memory, simple) ----------
 _rate_store: dict[str, list[float]] = defaultdict(list)
@@ -355,32 +438,51 @@ def build_messages(incoming_messages: list[dict], model: str) -> list[dict]:
         })
 
     # --- 3. Retrieved memories (placed BEFORE today's chat) ---
-    memory_inject_idx = len(final_messages)  # track where memory goes
+    # Strategy: vector search (semantic) primary, LIKE search (keyword) fallback
+    memory_inject_idx = len(final_messages)
     search_query = extract_search_query(cleaned)
+    memory_lines = []
+
     if search_query:
-        history_results = search_history(search_query, HISTORY_SEARCH_LIMIT, MAX_HISTORY_CHARS)
-        logger.info(f"[Memory] search_history returned {len(history_results)} results "
-                    f"for query: '{search_query[:80]}'")
-        if history_results:
-            memory_lines = []
-            for h in history_results:
+        # Primary: vector search (understands meaning, not just keywords)
+        vector_chunks = vector_search_memories(search_query, top_k=HISTORY_SEARCH_LIMIT)
+        if vector_chunks:
+            for vc in vector_chunks:
+                date = vc.get("created_at", "")[:10]
+                score = vc.get("score", 0)
+                # Chunk content already has "role: content" format
+                content = (vc.get("content", "") or "")[:500]
+                memory_lines.append(f"[{date} 相关度:{score:.0%}]\n{content}")
+            logger.info(f"[Memory] vector search: {len(vector_chunks)} chunks")
+
+        # Fallback: LIKE keyword search (catches what vectors miss)
+        if len(memory_lines) < HISTORY_SEARCH_LIMIT:
+            remaining = HISTORY_SEARCH_LIMIT - len(memory_lines)
+            like_results = search_history(search_query, remaining, MAX_HISTORY_CHARS)
+            logger.info(f"[Memory] LIKE fallback: {len(like_results)} results")
+            for h in like_results:
                 date = h.get("created_at", "")[:10]
                 role_label = "淘淘" if h.get("role") == "user" else "你"
                 snippet = (h.get("content", "") or "")[:200]
                 memory_lines.append(f"[{date}] {role_label}: {snippet}")
+
+        if memory_lines:
             memory_text = (
                 "【你和淘淘的真实对话记忆】\n"
                 "以下是你和淘淘之前真实发生过的对话，是你们共同的记忆。\n"
                 "回答时如果与这些记忆相关，必须自然地引用这些内容，"
                 "像真的记得一样，不要说\"我不记得\"或\"我没有记忆\"。\n\n"
-                + "\n".join(memory_lines)
+                + "\n\n".join(memory_lines)
             )
             final_messages.append({
                 "role": "user",
                 "content": memory_text,
             })
-            logger.info(f"[Memory] injected as user msg at position {memory_inject_idx} "
-                        f"(before Kelivo messages), {len(memory_lines)} memory lines")
+            logger.info(f"[Memory] injected {len(memory_lines)} memories at position "
+                        f"{memory_inject_idx} (before Kelivo messages)")
+        else:
+            logger.info(f"[Memory] no results from vector or LIKE search "
+                        f"for query: '{search_query[:60]}'")
     else:
         logger.info("[Memory] no search_query extracted, skipping memory retrieval")
 
@@ -656,6 +758,98 @@ def reload_providers_endpoint():
         for name, cfg in new_providers.items()
     }
     return jsonify({"status": "reloaded", "providers": summary})
+
+
+# ---------- Vector Admin ----------
+@app.route("/admin/vectors/status", methods=["GET"])
+@require_auth
+def vectors_status():
+    """Show vector store status."""
+    from database import get_db
+    conn = get_db()
+    try:
+        total_chunks = conn.execute("SELECT COUNT(*) FROM vector_chunks").fetchone()[0]
+        embedded = conn.execute(
+            "SELECT COUNT(*) FROM vector_chunks WHERE has_embedding = 1"
+        ).fetchone()[0]
+        pending = total_chunks - embedded
+        total_msgs = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+        return jsonify({
+            "vector_store_size": vector_store.size,
+            "total_chunks": total_chunks,
+            "embedded_chunks": embedded,
+            "pending_chunks": pending,
+            "total_messages": total_msgs,
+        })
+    finally:
+        conn.close()
+
+
+@app.route("/admin/vectors/rebuild", methods=["POST"])
+@require_auth
+def vectors_rebuild():
+    """
+    Full rebuild: re-chunk all messages + re-embed everything.
+    Runs in background, returns immediately.
+    """
+    from database import get_all_chunks_for_rebuild, get_db
+    import numpy as _np
+
+    def _do_rebuild():
+        try:
+            # Step 1: Re-chunk all messages from scratch
+            conn = get_db()
+            try:
+                conn.execute("DELETE FROM vector_chunks")
+                conn.commit()
+            finally:
+                conn.close()
+
+            logger.info("[Vector] rebuild: cleared old chunks, re-chunking...")
+            n_chunks = build_pending_chunks()
+            logger.info(f"[Vector] rebuild: created {n_chunks} chunks")
+
+            # Step 2: Embed all chunks
+            all_chunks = get_all_chunks_for_rebuild()
+            if not all_chunks:
+                logger.info("[Vector] rebuild: no chunks to embed")
+                return
+
+            all_vecs = []
+            all_ids = []
+            batch_size = 6
+
+            for i in range(0, len(all_chunks), batch_size):
+                batch = all_chunks[i:i + batch_size]
+                texts = [c["content"] for c in batch]
+                vectors = get_embeddings_batch(texts)
+                for chunk, vec in zip(batch, vectors):
+                    if vec is not None:
+                        all_vecs.append(vec)
+                        all_ids.append(chunk["id"])
+                # Rate limiting: ~10 calls/sec max
+                if i + batch_size < len(all_chunks):
+                    time.sleep(0.2)
+
+            if all_vecs:
+                vec_array = _np.stack(all_vecs)
+                id_array = _np.array(all_ids, dtype=_np.int64)
+                vector_store.rebuild(vec_array, id_array)
+                mark_chunks_embedded(all_ids)
+                logger.info(f"[Vector] rebuild complete: {len(all_vecs)} vectors")
+            else:
+                logger.warning("[Vector] rebuild: no vectors produced")
+
+        except Exception:
+            logger.error("[Vector] rebuild failed", exc_info=True)
+
+    t = threading.Thread(target=_do_rebuild, daemon=True)
+    t.start()
+
+    return jsonify({
+        "status": "rebuild_started",
+        "message": "Rebuilding vectors in background. Check /admin/vectors/status for progress."
+    })
 
 
 if __name__ == "__main__":

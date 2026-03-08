@@ -126,6 +126,23 @@ def init_db():
             message_count INTEGER,
             created_at TEXT DEFAULT (datetime('now'))
         );
+
+        -- Vector search: conversation chunks for embedding
+        CREATE TABLE IF NOT EXISTS vector_chunks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            conversation_id TEXT NOT NULL,
+            content TEXT NOT NULL,
+            msg_id_start INTEGER NOT NULL,
+            msg_id_end INTEGER NOT NULL,
+            round_count INTEGER DEFAULT 0,
+            has_embedding INTEGER DEFAULT 0,
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_chunks_embedding
+            ON vector_chunks(has_embedding);
+        CREATE INDEX IF NOT EXISTS idx_chunks_msg_range
+            ON vector_chunks(msg_id_end);
     """)
     conn.commit()
 
@@ -520,6 +537,155 @@ def get_recent_messages(conversation_id: str, limit: int = 10) -> list[dict]:
             (conversation_id, limit)
         ).fetchall()
         return [dict(r) for r in reversed(rows)]
+    finally:
+        conn.close()
+
+
+# ---------- Vector Chunking ----------
+
+CHUNK_ROUNDS = int(os.getenv("VECTOR_CHUNK_ROUNDS", "4"))  # user+assistant pairs per chunk
+
+
+def build_pending_chunks() -> int:
+    """
+    Scan messages table for new messages not yet chunked.
+    Groups by conversation_id, creates chunks of CHUNK_ROUNDS rounds each.
+    Returns number of new chunks created.
+    """
+    conn = get_db()
+    try:
+        # Find the highest msg_id already chunked
+        row = conn.execute("SELECT MAX(msg_id_end) FROM vector_chunks").fetchone()
+        last_chunked_id = row[0] if row and row[0] else 0
+
+        # Get all un-chunked messages ordered by id
+        rows = conn.execute(
+            """SELECT id, conversation_id, role, content, created_at
+               FROM messages WHERE id > ? ORDER BY id""",
+            (last_chunked_id,)
+        ).fetchall()
+
+        if not rows:
+            return 0
+
+        # Group by conversation_id, preserving order
+        from collections import OrderedDict
+        conv_msgs: dict[str, list[dict]] = OrderedDict()
+        for r in rows:
+            d = dict(r)
+            conv_id = d["conversation_id"]
+            if conv_id not in conv_msgs:
+                conv_msgs[conv_id] = []
+            conv_msgs[conv_id].append(d)
+
+        created = 0
+        for conv_id, msgs in conv_msgs.items():
+            # Count rounds: a round = one user message (assistant may follow)
+            rounds = []
+            current_round = []
+            for m in msgs:
+                current_round.append(m)
+                if m["role"] == "assistant":
+                    rounds.append(current_round)
+                    current_round = []
+            # Don't leave a dangling user message un-chunked (wait for assistant reply)
+            # unless there are already enough rounds
+            if current_round and len(rounds) >= CHUNK_ROUNDS:
+                pass  # leave current_round for next time
+            elif current_round:
+                continue  # not enough rounds yet, skip this conversation for now
+
+            # Create chunks of CHUNK_ROUNDS rounds
+            for i in range(0, len(rounds), CHUNK_ROUNDS):
+                batch = rounds[i:i + CHUNK_ROUNDS]
+                if len(batch) < 2 and i + CHUNK_ROUNDS < len(rounds):
+                    continue  # skip tiny trailing chunks unless it's the last one
+
+                all_msgs_in_chunk = [m for rnd in batch for m in rnd]
+                chunk_text = "\n".join(
+                    f"{m['role']}: {m['content']}"
+                    for m in all_msgs_in_chunk
+                    if m.get("content")
+                )
+                if not chunk_text.strip():
+                    continue
+
+                msg_id_start = all_msgs_in_chunk[0]["id"]
+                msg_id_end = all_msgs_in_chunk[-1]["id"]
+
+                conn.execute(
+                    """INSERT INTO vector_chunks
+                       (conversation_id, content, msg_id_start, msg_id_end, round_count)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (conv_id, chunk_text, msg_id_start, msg_id_end, len(batch))
+                )
+                created += 1
+
+        conn.commit()
+        logger.info(f"[Vector] created {created} new chunks from {len(rows)} messages")
+        return created
+    finally:
+        conn.close()
+
+
+def get_unembedded_chunks(limit: int = 50) -> list[dict]:
+    """Get chunks that don't have embeddings yet."""
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            """SELECT id, conversation_id, content, msg_id_start, msg_id_end, created_at
+               FROM vector_chunks WHERE has_embedding = 0
+               ORDER BY id LIMIT ?""",
+            (limit,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def mark_chunks_embedded(chunk_ids: list[int]):
+    """Mark chunks as having embeddings."""
+    if not chunk_ids:
+        return
+    conn = get_db()
+    try:
+        placeholders = ",".join("?" * len(chunk_ids))
+        conn.execute(
+            f"UPDATE vector_chunks SET has_embedding = 1 WHERE id IN ({placeholders})",
+            chunk_ids
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_chunks_by_ids(chunk_ids: list[int]) -> list[dict]:
+    """Fetch chunk content by IDs (for displaying search results)."""
+    if not chunk_ids:
+        return []
+    conn = get_db()
+    try:
+        placeholders = ",".join("?" * len(chunk_ids))
+        rows = conn.execute(
+            f"""SELECT id, conversation_id, content, msg_id_start, msg_id_end, created_at
+                FROM vector_chunks WHERE id IN ({placeholders})""",
+            chunk_ids
+        ).fetchall()
+        # Return in the order requested
+        id_to_row = {dict(r)["id"]: dict(r) for r in rows}
+        return [id_to_row[cid] for cid in chunk_ids if cid in id_to_row]
+    finally:
+        conn.close()
+
+
+def get_all_chunks_for_rebuild() -> list[dict]:
+    """Get all chunks for full vector rebuild."""
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT id, content FROM vector_chunks ORDER BY id"
+        ).fetchall()
+        return [dict(r) for r in rows]
     finally:
         conn.close()
 
