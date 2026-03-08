@@ -360,24 +360,32 @@ def _build_like_conditions(keywords: list[str], column: str = "content") -> tupl
 
 
 def search_history(query: str, limit: int = 5, max_chars: int = 4000,
-                   exclude_recent_hours: int = 24) -> list[dict]:
+                   exclude_recent: int = 50) -> list[dict]:
     """
     Search message history.
     Priority: jieba tokenized multi-keyword LIKE (works for Chinese),
     then FTS5 as fallback (works for English/indexed content).
 
-    exclude_recent_hours: skip messages from the last N hours to avoid
-    polluting results with today's "I don't remember" responses.
+    exclude_recent: skip the N most recent messages to avoid polluting
+    results with the current conversation (e.g. model saying "I don't remember").
+    Uses rowid instead of time because migrated data may have inaccurate timestamps.
     """
     conn = get_db()
     results = []
     seen = set()
 
-    # Time cutoff: exclude messages newer than this
-    cutoff = (datetime.now() - timedelta(hours=exclude_recent_hours)).strftime("%Y-%m-%d %H:%M:%S")
-    time_filter = "created_at < ?"
+    # Find the rowid cutoff: exclude the most recent N messages
+    try:
+        max_id_row = conn.execute("SELECT MAX(id) FROM messages").fetchone()
+        max_id = max_id_row[0] if max_id_row and max_id_row[0] else 0
+    except Exception:
+        max_id = 0
+    id_cutoff = max(0, max_id - exclude_recent)
+    recency_filter = "id <= ?"
+
     logger.info(f"[Memory] search_history called: query='{query[:80]}', "
-                f"limit={limit}, cutoff={cutoff}")
+                f"limit={limit}, max_id={max_id}, id_cutoff={id_cutoff} "
+                f"(excluding latest {exclude_recent} msgs)")
 
     def _add_rows(rows):
         for row in rows:
@@ -399,9 +407,9 @@ def search_history(query: str, limit: int = 5, max_chars: int = 4000,
             # First try exact query match
             exact_rows = conn.execute(
                 f"""SELECT role, content, created_at, conversation_id
-                    FROM messages WHERE content LIKE ? AND {time_filter}
-                    ORDER BY created_at DESC LIMIT ?""",
-                (f"%{query}%", cutoff, limit)
+                    FROM messages WHERE content LIKE ? AND {recency_filter}
+                    ORDER BY id DESC LIMIT ?""",
+                (f"%{query}%", id_cutoff, limit)
             ).fetchall()
             _add_rows(exact_rows)
             logger.info(f"[Memory] phase1-exact: {len(exact_rows)} rows, total={len(results)}")
@@ -411,9 +419,9 @@ def search_history(query: str, limit: int = 5, max_chars: int = 4000,
                 where_sql, params = _build_like_conditions(keywords)
                 kw_rows = conn.execute(
                     f"""SELECT role, content, created_at, conversation_id
-                        FROM messages WHERE {where_sql} AND {time_filter}
-                        ORDER BY created_at DESC LIMIT ?""",
-                    params + [cutoff, limit - len(results)]
+                        FROM messages WHERE {where_sql} AND {recency_filter}
+                        ORDER BY id DESC LIMIT ?""",
+                    params + [id_cutoff, limit - len(results)]
                 ).fetchall()
                 _add_rows(kw_rows)
                 logger.info(f"[Memory] phase1-multi-kw: {len(kw_rows)} rows, total={len(results)}")
@@ -427,9 +435,9 @@ def search_history(query: str, limit: int = 5, max_chars: int = 4000,
                         continue  # skip single-char tokens for noise reduction
                     single_rows = conn.execute(
                         f"""SELECT role, content, created_at, conversation_id
-                            FROM messages WHERE content LIKE ? AND {time_filter}
-                            ORDER BY created_at DESC LIMIT ?""",
-                        (f"%{kw}%", cutoff, limit - len(results))
+                            FROM messages WHERE content LIKE ? AND {recency_filter}
+                            ORDER BY id DESC LIMIT ?""",
+                        (f"%{kw}%", id_cutoff, limit - len(results))
                     ).fetchall()
                     _add_rows(single_rows)
                 logger.info(f"[Memory] phase1-single-kw: total={len(results)}")
@@ -444,10 +452,10 @@ def search_history(query: str, limit: int = 5, max_chars: int = 4000,
                         f"""SELECT m.role, m.content, m.created_at, m.conversation_id
                             FROM messages_fts f
                             JOIN messages m ON m.conversation_id = f.conversation_id
-                            WHERE messages_fts MATCH ? AND m.{time_filter}
-                            ORDER BY m.created_at DESC
+                            WHERE messages_fts MATCH ? AND m.{recency_filter}
+                            ORDER BY m.id DESC
                             LIMIT ?""",
-                        (safe_fts_query, cutoff, limit - len(results))
+                        (safe_fts_query, id_cutoff, limit - len(results))
                     ).fetchall()
                     _add_rows(fts_rows)
                     logger.info(f"[Memory] phase2-fts5: {len(fts_rows)} rows, total={len(results)}")
@@ -464,19 +472,16 @@ def search_history(query: str, limit: int = 5, max_chars: int = 4000,
                     "timestamp" if "timestamp" in backup_cols else None)
                 r_col = "role" if "role" in backup_cols else None
                 if c_col:
-                    # Legacy table may not have timestamp, add time filter only if possible
-                    time_clause = f" AND {t_col} < ?" if t_col else ""
-                    time_params = [cutoff] if t_col else []
                     legacy_sql = f"""SELECT
                         {f'{r_col}' if r_col else "'user'"} as role,
                         {c_col} as content,
                         {t_col if t_col else "'unknown'"} as created_at,
                         'legacy' as conversation_id
                         FROM chat_history_backup
-                        WHERE {c_col} LIKE ?{time_clause}
+                        WHERE {c_col} LIKE ?
                         ORDER BY rowid DESC LIMIT ?"""
                     legacy_rows = conn.execute(
-                        legacy_sql, [f"%{query}%"] + time_params + [limit - len(results)]
+                        legacy_sql, [f"%{query}%", limit - len(results)]
                     ).fetchall()
                     _add_rows(legacy_rows)
             except Exception as e:
