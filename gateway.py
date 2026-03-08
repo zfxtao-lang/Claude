@@ -65,59 +65,66 @@ start_writer()  # Start async DB write thread
 
 
 # ---------- Background Embedding Worker ----------
-def _embedding_worker():
-    """Background thread: chunk new messages → embed → store vectors."""
-    import time as _time
-    logger.info("[Vector] background embedding worker started")
-    while True:
-        try:
-            # 1. Create chunks from new messages
-            new_chunks = build_pending_chunks()
+# REMOVED: realtime embedding worker that caused vector pollution.
+# Vectorization is now done by scheduled nightly batch job.
+# See: POST /admin/vectors/rebuild  or  cron job calling _do_nightly_vectorize()
 
-            # 2. Embed un-embedded chunks
-            pending = get_unembedded_chunks(limit=30)
-            if pending:
-                texts = [c["content"] for c in pending]
-                vectors = get_embeddings_batch(texts)
+def _do_nightly_vectorize():
+    """
+    Nightly batch: chunk yesterday's messages → embed → store vectors.
+    Called by /admin/vectors/nightly or cron. Not realtime.
+    """
+    try:
+        new_chunks = build_pending_chunks()
+        if new_chunks == 0:
+            logger.info("[Vector] nightly: no new chunks to embed")
+            return 0
 
-                embedded_ids = []
-                for chunk, vec in zip(pending, vectors):
-                    if vec is not None:
-                        vector_store.add(chunk["id"], vec)
-                        embedded_ids.append(chunk["id"])
+        pending = get_unembedded_chunks(limit=200)
+        if not pending:
+            return 0
 
-                if embedded_ids:
-                    mark_chunks_embedded(embedded_ids)
-                    vector_store.save()
-                    logger.info(f"[Vector] embedded {len(embedded_ids)} chunks, "
-                                f"store size: {vector_store.size}")
+        texts = [c["content"] for c in pending]
+        embedded_ids = []
 
-        except Exception:
-            logger.error("[Vector] embedding worker error", exc_info=True)
+        # Batch embed (6 per API call)
+        for i in range(0, len(texts), 6):
+            batch = texts[i:i + 6]
+            vectors = get_embeddings_batch(batch)
+            for chunk, vec in zip(pending[i:i + 6], vectors):
+                if vec is not None:
+                    vector_store.add(chunk["id"], vec)
+                    embedded_ids.append(chunk["id"])
+            time.sleep(0.2)  # rate limit
 
-        _time.sleep(60)  # run every 60 seconds
+        if embedded_ids:
+            mark_chunks_embedded(embedded_ids)
+            vector_store.save()
+            logger.info(f"[Vector] nightly: embedded {len(embedded_ids)} chunks, "
+                        f"store size: {vector_store.size}")
+        return len(embedded_ids)
 
-
-_embedding_thread = threading.Thread(target=_embedding_worker, daemon=True)
-_embedding_thread.start()
+    except Exception:
+        logger.error("[Vector] nightly vectorize failed", exc_info=True)
+        return 0
 
 
 # ---------- Vector Search ----------
 VECTOR_MIN_SCORE = float(os.getenv("VECTOR_MIN_SCORE", "0.2"))
 VECTOR_NEIGHBOR_WINDOW = int(os.getenv("VECTOR_NEIGHBOR_WINDOW", "1"))
+VECTOR_EXCLUDE_HOURS = int(os.getenv("VECTOR_EXCLUDE_HOURS", "2"))
 
 
 def vector_search_memories(query: str, top_k: int = 5,
                            min_score: float = None) -> list[dict]:
     """
-    Search memories using vector similarity + context expansion.
+    Search memories using vector similarity + context expansion + time filter.
 
-    1. Find top_k most similar chunks
-    2. For each matched chunk, also pull ±VECTOR_NEIGHBOR_WINDOW neighboring
-       chunks from the same conversation (restores full topic context)
-    3. Merge and deduplicate, sorted by conversation → time order
-
-    Returns list of chunk dicts with content.
+    1. Embed the raw user query (NOT jieba-extracted keywords)
+    2. Find top_k most similar chunks
+    3. Filter out chunks from the last VECTOR_EXCLUDE_HOURS
+    4. Expand with neighboring chunks from same conversation
+    5. Return grouped by conversation in time order
     """
     if min_score is None:
         min_score = VECTOR_MIN_SCORE
@@ -131,8 +138,8 @@ def vector_search_memories(query: str, top_k: int = 5,
         logger.warning("[Vector] failed to embed query, skipping vector search")
         return []
 
-    results = vector_store.search(query_vec, top_k=top_k)
-    # Filter by minimum score
+    # Search with extra headroom (some will be filtered by time)
+    results = vector_store.search(query_vec, top_k=top_k * 3)
     good_results = [(cid, score) for cid, score in results if score >= min_score]
 
     if not good_results:
@@ -140,11 +147,29 @@ def vector_search_memories(query: str, top_k: int = 5,
         logger.info(f"[Vector] no results above min_score={min_score} (best: {best})")
         return []
 
-    matched_ids = [cid for cid, _ in good_results]
+    # Fetch chunk metadata for time filtering
+    candidate_ids = [cid for cid, _ in good_results]
     scores = {cid: score for cid, score in good_results}
+    candidates = get_chunks_by_ids(candidate_ids)
 
-    logger.info(f"[Vector] matched {len(matched_ids)} chunks, "
-                f"scores: {[f'{s:.3f}' for _, s in good_results]}")
+    # Time filter: exclude chunks from last N hours
+    from datetime import datetime, timedelta
+    cutoff = (datetime.now() - timedelta(hours=VECTOR_EXCLUDE_HOURS)).strftime("%Y-%m-%d %H:%M:%S")
+    filtered = [c for c in candidates if (c.get("created_at", "") or "") < cutoff]
+    excluded_count = len(candidates) - len(filtered)
+    if excluded_count:
+        logger.info(f"[Vector] time filter excluded {excluded_count} chunks "
+                    f"(< {VECTOR_EXCLUDE_HOURS}h old)")
+
+    # Take top_k after filtering
+    filtered = filtered[:top_k]
+    if not filtered:
+        logger.info("[Vector] all results filtered by time")
+        return []
+
+    matched_ids = [c["id"] for c in filtered]
+    logger.info(f"[Vector] matched {len(matched_ids)} chunks after time filter, "
+                f"scores: {[f'{scores.get(cid, 0):.3f}' for cid in matched_ids]}")
 
     # Context expansion: pull in neighboring chunks from same conversations
     if VECTOR_NEIGHBOR_WINDOW > 0:
@@ -391,12 +416,15 @@ def extract_search_query(messages: list[dict], max_msgs: int = 5) -> str:
         context = " ".join(recent_texts)
 
     # Tokenize and deduplicate keywords, keep order
+    # Keep all tokens ≥2 chars (铁锅, 煲, 汤 are all ≥1 Chinese char = 1 len in Python)
+    # Only filter out single-char particles: 的了是在有不我你他她它这那
+    _STOP_CHARS = set("的了是在有不我你他她它这那很都也还要会被把让给到过着得")
     tokens = jieba_tokenize(context).split()
     seen = set()
     keywords = []
     for t in tokens:
-        if len(t) < 2:
-            continue  # skip single chars (的, 了, 是, ...)
+        if t in _STOP_CHARS:
+            continue  # skip particles/pronouns only
         if t not in seen:
             seen.add(t)
             keywords.append(t)
@@ -406,6 +434,54 @@ def extract_search_query(messages: list[dict], max_msgs: int = 5) -> str:
     logger.info(f"[Memory] search_query extracted: '{query}' "
                 f"(from {len(recent_texts)} recent msgs, latest={len(latest)} chars)")
     return query
+
+
+# ---------- Model-Specific Memory Formatting ----------
+
+def _model_family(model: str) -> str:
+    """Detect model family from model name for format switching."""
+    m = model.lower()
+    if "claude" in m or "anthropic/" in m:
+        return "claude"
+    if "deepseek" in m:
+        return "deepseek"
+    if "glm" in m:
+        return "zhipu"
+    if "qwen" in m:
+        return "qwen"
+    return "default"
+
+
+def _format_memory_for_model(model: str, memory_content: str) -> str:
+    """
+    Format memory injection based on model family.
+    Claude responds better to XML-structured instructions.
+    Chinese models respond better to direct Chinese prompts.
+    """
+    family = _model_family(model)
+
+    if family == "claude":
+        return (
+            "<memory_context>\n"
+            "<instructions>\n"
+            "Below are real conversations between you and 淘淘 from the past. "
+            "These are your shared memories. When relevant to the current question, "
+            "reference these naturally as if you truly remember. "
+            "Never say you don't have memory or can't remember.\n"
+            "</instructions>\n"
+            "<conversations>\n"
+            f"{memory_content}\n"
+            "</conversations>\n"
+            "</memory_context>"
+        )
+    else:
+        return (
+            "【你和淘淘的真实对话记忆】\n"
+            "以下是你和淘淘之前真实发生过的对话，是你们共同的记忆。\n"
+            "回答时如果与这些记忆相关，必须自然地引用这些内容，"
+            "像真的记得一样，不要说\"我不记得\"或\"我没有记忆\"。\n\n"
+            f"{memory_content}"
+        )
 
 
 # ---------- Provider Call (all OpenAI-compatible) ----------
@@ -469,16 +545,17 @@ def build_messages(incoming_messages: list[dict], model: str) -> list[dict]:
         })
 
     # --- 3. Retrieved memories (placed BEFORE today's chat) ---
-    # Strategy: vector search (semantic) primary, LIKE search (keyword) fallback
+    # Vector search: uses RAW user message (semantic understanding, no jieba needed)
+    # LIKE fallback: uses jieba-extracted keywords (catches what vectors miss)
     memory_inject_idx = len(final_messages)
-    search_query = extract_search_query(cleaned)
+    raw_user_msg = extract_latest_user_message(cleaned)
     memory_lines = []
 
-    if search_query:
-        # Primary: vector search (semantic + context expansion)
-        vector_chunks = vector_search_memories(search_query, top_k=HISTORY_SEARCH_LIMIT)
+    if raw_user_msg:
+        # --- Primary: vector search with original user message ---
+        logger.info(f"[Memory] vector query (raw): '{raw_user_msg[:80]}'")
+        vector_chunks = vector_search_memories(raw_user_msg, top_k=HISTORY_SEARCH_LIMIT)
         if vector_chunks:
-            # Group chunks by conversation for coherent presentation
             from collections import OrderedDict
             conv_groups: dict[str, list[dict]] = OrderedDict()
             for vc in vector_chunks:
@@ -488,9 +565,7 @@ def build_messages(incoming_messages: list[dict], model: str) -> list[dict]:
                 conv_groups[cid].append(vc)
 
             for conv_id, chunks in conv_groups.items():
-                # Sort chunks within conversation by message order
                 chunks.sort(key=lambda c: c.get("msg_id_start", 0))
-                # Combine chunks from same conversation into one memory block
                 parts = []
                 for vc in chunks:
                     content = (vc.get("content", "") or "")[:600]
@@ -505,36 +580,35 @@ def build_messages(incoming_messages: list[dict], model: str) -> list[dict]:
             logger.info(f"[Memory] vector search: {direct} direct + {context} context "
                         f"= {len(vector_chunks)} chunks, {len(conv_groups)} conversations")
 
-        # Fallback: LIKE keyword search (catches what vectors miss)
+        # --- Fallback: LIKE keyword search (jieba, for what vectors missed) ---
         if len(memory_lines) < HISTORY_SEARCH_LIMIT:
-            remaining = HISTORY_SEARCH_LIMIT - len(memory_lines)
-            like_results = search_history(search_query, remaining, MAX_HISTORY_CHARS)
-            logger.info(f"[Memory] LIKE fallback: {len(like_results)} results")
-            for h in like_results:
-                date = h.get("created_at", "")[:10]
-                role_label = "淘淘" if h.get("role") == "user" else "你"
-                snippet = (h.get("content", "") or "")[:200]
-                memory_lines.append(f"[{date}] {role_label}: {snippet}")
+            like_query = extract_search_query(cleaned)
+            if like_query:
+                remaining = HISTORY_SEARCH_LIMIT - len(memory_lines)
+                like_results = search_history(like_query, remaining, MAX_HISTORY_CHARS)
+                logger.info(f"[Memory] LIKE fallback: query='{like_query[:60]}', "
+                            f"{len(like_results)} results")
+                for h in like_results:
+                    date = h.get("created_at", "")[:10]
+                    role_label = "淘淘" if h.get("role") == "user" else "你"
+                    snippet = (h.get("content", "") or "")[:200]
+                    memory_lines.append(f"[{date}] {role_label}: {snippet}")
 
+        # --- Inject memories with model-specific format ---
         if memory_lines:
-            memory_text = (
-                "【你和淘淘的真实对话记忆】\n"
-                "以下是你和淘淘之前真实发生过的对话，是你们共同的记忆。\n"
-                "回答时如果与这些记忆相关，必须自然地引用这些内容，"
-                "像真的记得一样，不要说\"我不记得\"或\"我没有记忆\"。\n\n"
-                + "\n\n".join(memory_lines)
-            )
+            memory_content = "\n\n".join(memory_lines)
+            memory_text = _format_memory_for_model(model, memory_content)
             final_messages.append({
                 "role": "user",
                 "content": memory_text,
             })
             logger.info(f"[Memory] injected {len(memory_lines)} memories at position "
-                        f"{memory_inject_idx} (before Kelivo messages)")
+                        f"{memory_inject_idx} (before Kelivo messages, format={_model_family(model)})")
         else:
             logger.info(f"[Memory] no results from vector or LIKE search "
-                        f"for query: '{search_query[:60]}'")
+                        f"for raw query: '{raw_user_msg[:60]}'")
     else:
-        logger.info("[Memory] no search_query extracted, skipping memory retrieval")
+        logger.info("[Memory] no user message found, skipping memory retrieval")
 
     # --- 4. Today's conversation from Kelivo ---
     kelivo_start_idx = len(final_messages)
@@ -905,6 +979,23 @@ def vectors_rebuild():
         "status": "rebuild_started",
         "message": "Rebuilding vectors in background. Check /admin/vectors/status for progress."
     })
+
+
+@app.route("/admin/vectors/nightly", methods=["POST"])
+@require_auth
+def vectors_nightly():
+    """
+    Nightly vectorization: chunk + embed new messages.
+    Call this from cron after daily summary, or manually.
+    Only processes messages not yet chunked/embedded.
+    """
+    def _run():
+        count = _do_nightly_vectorize()
+        logger.info(f"[Vector] nightly job done: {count} chunks embedded")
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    return jsonify({"status": "nightly_started"})
 
 
 if __name__ == "__main__":

@@ -4,3 +4,8 @@ __pycache__/
 *.db
 backups/
 venv/
+
+# User-specific files (don't overwrite on git pull)
+system_prompt.txt
+vectors.npy
+vectors_ids.npy
