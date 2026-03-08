@@ -223,6 +223,74 @@ def extract_latest_user_message(messages: list[dict]) -> str:
     return ""
 
 
+def _extract_msg_text(msg: dict) -> str:
+    """Extract plain text from a message (handles both str and multimodal list)."""
+    content = msg.get("content", "")
+    if isinstance(content, list):
+        texts = [p.get("text", "") for p in content if p.get("type") == "text"]
+        return " ".join(texts).strip()
+    return str(content).strip() if content else ""
+
+
+def extract_search_query(messages: list[dict], max_msgs: int = 5) -> str:
+    """
+    Build a search query from the recent conversation context.
+
+    Short user messages like "不是这个呢" / "对" / "嗯" are useless for search.
+    Strategy:
+      1. Collect the last max_msgs user+assistant messages
+      2. Use jieba to extract keywords from all of them
+      3. Deduplicate and return as a combined query string
+
+    This gives the search engine enough context even when the latest
+    message is just "不是这个".
+    """
+    from database import jieba_tokenize
+
+    # Collect recent messages (user + assistant only)
+    recent_texts = []
+    count = 0
+    for msg in reversed(messages):
+        if msg.get("role") not in ("user", "assistant"):
+            continue
+        text = _extract_msg_text(msg)
+        if not text:
+            continue
+        recent_texts.append(text)
+        count += 1
+        if count >= max_msgs:
+            break
+
+    if not recent_texts:
+        return ""
+
+    # The latest user message
+    latest = recent_texts[0] if recent_texts else ""
+
+    # If the latest message is already substantial (>10 chars), use it directly
+    # combined with a bit of context from the previous message
+    if len(latest) > 10:
+        # Still add one prior message for better context
+        context = " ".join(recent_texts[:2])
+    else:
+        # Short message - pull in more context
+        context = " ".join(recent_texts)
+
+    # Tokenize and deduplicate keywords, keep order
+    tokens = jieba_tokenize(context).split()
+    seen = set()
+    keywords = []
+    for t in tokens:
+        if len(t) < 2:
+            continue  # skip single chars (的, 了, 是, ...)
+        if t not in seen:
+            seen.add(t)
+            keywords.append(t)
+
+    # Cap at ~15 keywords to avoid overly broad queries
+    return " ".join(keywords[:15])
+
+
 # ---------- Provider Call (all OpenAI-compatible) ----------
 def call_provider(provider_cfg: dict, messages: list[dict],
                   model: str, stream: bool, **kwargs) -> requests.Response:
@@ -288,9 +356,9 @@ def build_messages(incoming_messages: list[dict], model: str) -> list[dict]:
         final_messages.append(msg)
 
     # Search history for context, inject as system message before the last user msg
-    user_query = extract_latest_user_message(cleaned)
-    if user_query:
-        history_results = search_history(user_query, HISTORY_SEARCH_LIMIT, MAX_HISTORY_CHARS)
+    search_query = extract_search_query(cleaned)
+    if search_query:
+        history_results = search_history(search_query, HISTORY_SEARCH_LIMIT, MAX_HISTORY_CHARS)
         if history_results:
             memory_lines = []
             for h in history_results:
@@ -319,6 +387,37 @@ def build_messages(incoming_messages: list[dict], model: str) -> list[dict]:
     return final_messages
 
 
+# ---------- Kelivo Internal Request Detection ----------
+_KELIVO_INTERNAL_PATTERNS = [
+    "Generate or update a brief summary",
+    "generate or update a brief summary",
+    "Generate a brief summary",
+    "Update the summary",
+    "Summarize the conversation",
+    "summarize the conversation",
+    "Create a title for this conversation",
+    "create a title for this conversation",
+]
+
+
+def _is_kelivo_summary_request(messages: list[dict]) -> bool:
+    """
+    Detect Kelivo's internal housekeeping requests (summary generation, title
+    generation, etc.) that should NOT go through the normal chat pipeline.
+    """
+    if not messages:
+        return False
+    # Check the last message (usually a system or user message with the instruction)
+    for msg in messages:
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            content = " ".join(p.get("text", "") for p in content if p.get("type") == "text")
+        content_str = str(content) if content else ""
+        if any(pat in content_str for pat in _KELIVO_INTERNAL_PATTERNS):
+            return True
+    return False
+
+
 # ---------- Main Chat Endpoint ----------
 @app.route("/v1/chat/completions", methods=["POST", "OPTIONS"])
 @require_auth
@@ -341,6 +440,22 @@ def chat_completions():
 
     logger.info(f"Request: model={model}, stream={stream}, "
                 f"messages_count={len(incoming_messages)}")
+
+    # Intercept Kelivo internal summary requests - don't waste API calls
+    if _is_kelivo_summary_request(incoming_messages):
+        logger.info("Intercepted Kelivo summary request, returning empty summary")
+        return jsonify({
+            "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "OK"},
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        })
 
     # Route to provider
     provider_cfg = get_provider_for_model(model)
