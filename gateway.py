@@ -23,6 +23,7 @@ from functools import wraps
 import requests
 from flask import Flask, Response, jsonify, request, stream_with_context
 
+import config
 from config import (
     API_MAX_RETRIES,
     API_RETRY_BACKOFF,
@@ -36,6 +37,7 @@ from config import (
     RATE_LIMIT_RPM,
     get_provider_for_model,
     load_system_prompt,
+    reload_providers,
 )
 from database import backup_database, init_db, save_message, search_history, start_writer
 from notion_cache import get_notion_content, invalidate_cache
@@ -103,10 +105,10 @@ def add_cors_headers(response):
 def health():
     """Health check endpoint for monitoring."""
     provider_status = {}
-    for name, cfg in PROVIDERS.items():
+    for name, cfg in config.PROVIDERS.items():
         provider_status[name] = {
-            "configured": bool(cfg["api_key"]),
-            "prefixes": cfg["prefixes"],
+            "configured": bool(cfg.get("api_key")),
+            "prefixes": cfg.get("prefixes", []),
         }
     return jsonify({
         "status": "ok",
@@ -400,13 +402,13 @@ def chat_completions():
 def list_models():
     """Return available providers and their supported prefixes."""
     providers = []
-    for name, cfg in PROVIDERS.items():
-        if not cfg["api_key"]:
+    for name, cfg in config.PROVIDERS.items():
+        if not cfg.get("api_key"):
             continue
         providers.append({
             "provider": name,
-            "prefixes": cfg["prefixes"],
-            "base_url": cfg["base_url"],
+            "prefixes": cfg.get("prefixes", []),
+            "base_url": cfg.get("base_url", ""),
         })
     return jsonify({"object": "list", "data": providers})
 
@@ -451,6 +453,23 @@ def stats():
         })
     finally:
         conn.close()
+
+
+# ---------- Provider Hot-Reload ----------
+@app.route("/admin/providers/reload", methods=["POST"])
+@require_auth
+def reload_providers_endpoint():
+    """Hot-reload providers.json without restarting the gateway."""
+    new_providers = reload_providers()
+    config.PROVIDERS = new_providers
+    # Update module-level reference
+    import gateway
+    summary = {
+        name: {"prefixes": cfg.get("prefixes", []),
+               "has_key": bool(cfg.get("api_key"))}
+        for name, cfg in new_providers.items()
+    }
+    return jsonify({"status": "reloaded", "providers": summary})
 
 
 if __name__ == "__main__":

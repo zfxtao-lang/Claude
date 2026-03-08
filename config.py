@@ -1,41 +1,60 @@
 """
 Gateway configuration - multi-provider routing, timeout, rate limiting
+
+Provider routing is config-driven via providers.json.
+Adding a new provider = adding a JSON block, zero code changes.
 """
+import json
+import logging
 import os
 
 from dotenv import load_dotenv
 
 load_dotenv()  # Load .env file
 
-# ---------- API Providers ----------
-# Each provider: name -> {base_url, api_key, prefixes[], timeout}
-# Model routing uses prefix matching: model "anthropic/claude-3" matches prefix "anthropic/"
-PROVIDERS = {
-    "openrouter": {
-        "base_url": os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
-        "api_key": os.getenv("OPENROUTER_API_KEY", ""),
-        "prefixes": ["anthropic/", "openai/", "google/"],
-        "timeout": int(os.getenv("OPENROUTER_TIMEOUT", "120")),
-    },
-    "deepseek": {
-        "base_url": os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"),
-        "api_key": os.getenv("DEEPSEEK_API_KEY", ""),
-        "prefixes": ["deepseek-"],
-        "timeout": int(os.getenv("DEEPSEEK_TIMEOUT", "120")),
-    },
-    "zhipu": {
-        "base_url": os.getenv("ZHIPU_BASE_URL", "https://open.bigmodel.cn/api/paas/v4"),
-        "api_key": os.getenv("ZHIPU_API_KEY", ""),
-        "prefixes": ["glm-"],
-        "timeout": int(os.getenv("ZHIPU_TIMEOUT", "120")),
-    },
-    "alibaba": {
-        "base_url": os.getenv("ALIBABA_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
-        "api_key": os.getenv("ALIBABA_API_KEY", ""),
-        "prefixes": ["qwen-"],
-        "timeout": int(os.getenv("ALIBABA_TIMEOUT", "120")),
-    },
-}
+logger = logging.getLogger(__name__)
+
+# ---------- API Providers (loaded from providers.json) ----------
+PROVIDERS_FILE = os.getenv("PROVIDERS_FILE", "providers.json")
+
+
+def _load_providers() -> dict:
+    """
+    Load providers from JSON config file.
+    Each entry's api_key supports ${ENV_VAR} syntax for env var substitution.
+    Falls back to empty dict if file not found.
+    """
+    try:
+        with open(PROVIDERS_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except FileNotFoundError:
+        logger.warning(f"providers.json not found at {PROVIDERS_FILE}, no providers loaded")
+        return {}
+
+    providers = {}
+    for name, cfg in raw.items():
+        # Resolve ${ENV_VAR} or $ENV_VAR in string values
+        resolved = {}
+        for key, val in cfg.items():
+            if isinstance(val, str) and val.startswith("$"):
+                env_name = val.lstrip("$").strip("{}")
+                resolved[key] = os.getenv(env_name, "")
+            else:
+                resolved[key] = val
+        # Ensure required fields have defaults
+        resolved.setdefault("prefixes", [])
+        resolved.setdefault("timeout", 120)
+        resolved.setdefault("base_url", "")
+        resolved.setdefault("api_key", "")
+        providers[name] = resolved
+
+    configured = [n for n, c in providers.items() if c.get("api_key")]
+    logger.info(f"Loaded {len(providers)} providers, {len(configured)} with API keys: "
+                f"{configured}")
+    return providers
+
+
+PROVIDERS = _load_providers()
 
 # ---------- Gateway Auth ----------
 GATEWAY_AUTH_TOKEN = os.getenv("GATEWAY_AUTH_TOKEN", "")
@@ -73,12 +92,27 @@ API_RETRY_BACKOFF = float(os.getenv("API_RETRY_BACKOFF", "1.0"))  # seconds
 
 
 def get_provider_for_model(model: str) -> dict | None:
-    """Find which provider handles a given model name (prefix matching)."""
+    """
+    Find which provider handles a given model name (prefix matching).
+    Longer prefix matches first (e.g. "deepseek-chat" beats "deep").
+    """
+    best_match = None
+    best_prefix_len = 0
     for name, cfg in PROVIDERS.items():
-        for prefix in cfg["prefixes"]:
-            if model.startswith(prefix):
-                return {"provider": name, **cfg}
-    return None
+        if not cfg.get("api_key"):
+            continue  # skip unconfigured providers
+        for prefix in cfg.get("prefixes", []):
+            if model.startswith(prefix) and len(prefix) > best_prefix_len:
+                best_match = {"provider": name, **cfg}
+                best_prefix_len = len(prefix)
+    return best_match
+
+
+def reload_providers():
+    """Hot-reload providers from config file without restarting."""
+    global PROVIDERS
+    PROVIDERS = _load_providers()
+    return PROVIDERS
 
 
 def load_system_prompt() -> str:
