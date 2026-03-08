@@ -42,9 +42,25 @@ def get_db() -> sqlite3.Connection:
     return conn
 
 
+def _get_table_columns(conn: sqlite3.Connection, table: str) -> list[str]:
+    """Get column names for a table."""
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return [row["name"] for row in rows]
+
+
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    """Check if a table exists."""
+    row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
+    ).fetchone()
+    return row is not None
+
+
 def init_db():
-    """Create tables if not exist."""
+    """Create tables if not exist, migrate legacy chat_history if found."""
     conn = get_db()
+
+    # --- Create new schema tables ---
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS conversations (
             id TEXT PRIMARY KEY,
@@ -70,7 +86,6 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_messages_conv
             ON messages(conversation_id, created_at);
 
-        -- FTS5 table for full-text search (tokenized by jieba externally)
         CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
             conversation_id,
             content,
@@ -92,7 +107,129 @@ def init_db():
         );
     """)
     conn.commit()
+
+    # --- Migrate legacy chat_history table if it exists ---
+    if _table_exists(conn, "chat_history"):
+        _migrate_chat_history(conn)
+
     conn.close()
+
+
+def _migrate_chat_history(conn: sqlite3.Connection):
+    """
+    Migrate data from legacy chat_history table into the new messages table.
+    Handles various old column layouts gracefully. Never deletes old data.
+    """
+    # Check if already migrated (messages table has data)
+    msg_count = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+    old_count = conn.execute("SELECT COUNT(*) FROM chat_history").fetchone()[0]
+    if old_count == 0:
+        return
+    if msg_count >= old_count:
+        logger.info(f"Migration already done ({msg_count} messages exist, "
+                     f"{old_count} in chat_history). Skipping.")
+        return
+
+    logger.info(f"Migrating {old_count} records from chat_history -> messages ...")
+
+    old_cols = _get_table_columns(conn, "chat_history")
+    logger.info(f"chat_history columns: {old_cols}")
+
+    # Build SELECT mapping: figure out what the old table has
+    has_conversation_id = "conversation_id" in old_cols
+    has_role = "role" in old_cols
+    has_content = "content" in old_cols
+    has_message = "message" in old_cols  # some old schemas use "message" instead
+    has_model = "model" in old_cols
+    has_provider = "provider" in old_cols
+    has_tokens_in = "tokens_in" in old_cols
+    has_tokens_out = "tokens_out" in old_cols
+    has_created_at = "created_at" in old_cols
+    has_timestamp = "timestamp" in old_cols  # another common variant
+
+    # Content column: prefer "content", fall back to "message"
+    content_col = "content" if has_content else ("message" if has_message else None)
+    if not content_col:
+        logger.warning("chat_history has no 'content' or 'message' column. "
+                        "Cannot migrate.")
+        return
+
+    # Time column
+    time_col = "created_at" if has_created_at else ("timestamp" if has_timestamp else None)
+
+    # Read all old records
+    rows = conn.execute(f"SELECT * FROM chat_history ORDER BY rowid").fetchall()
+
+    migrated = 0
+    for row in rows:
+        row_dict = dict(row)
+
+        content = row_dict.get(content_col, "") or ""
+        if not content.strip():
+            continue
+
+        role = row_dict.get("role", "user") if has_role else "user"
+        conv_id = (row_dict.get("conversation_id", "") or "") if has_conversation_id else ""
+        model = (row_dict.get("model", "") or "") if has_model else ""
+        provider = (row_dict.get("provider", "") or "") if has_provider else ""
+        tokens_in = row_dict.get("tokens_in", 0) if has_tokens_in else 0
+        tokens_out = row_dict.get("tokens_out", 0) if has_tokens_out else 0
+
+        # Determine created_at
+        created_at = None
+        if time_col:
+            created_at = row_dict.get(time_col)
+
+        # Generate conversation_id from date if missing
+        if not conv_id:
+            if created_at and len(str(created_at)) >= 10:
+                date_part = str(created_at)[:10]  # "2025-03-01"
+                conv_id = f"legacy-{date_part}"
+            else:
+                conv_id = "legacy-unknown"
+
+        # Ensure conversation exists
+        conn.execute(
+            "INSERT OR IGNORE INTO conversations (id, title, model) VALUES (?, ?, ?)",
+            (conv_id, "", model)
+        )
+
+        # Insert into messages
+        if created_at:
+            conn.execute(
+                """INSERT INTO messages
+                   (conversation_id, role, content, model, provider,
+                    tokens_in, tokens_out, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (conv_id, role, content, model, provider,
+                 tokens_in or 0, tokens_out or 0, created_at)
+            )
+        else:
+            conn.execute(
+                """INSERT INTO messages
+                   (conversation_id, role, content, model, provider,
+                    tokens_in, tokens_out)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (conv_id, role, content, model, provider,
+                 tokens_in or 0, tokens_out or 0)
+            )
+
+        # Index in FTS5
+        tokenized = jieba_tokenize(content)
+        if tokenized:
+            conn.execute(
+                "INSERT INTO messages_fts (conversation_id, content) VALUES (?, ?)",
+                (conv_id, tokenized)
+            )
+        migrated += 1
+
+    conn.commit()
+
+    # Rename old table to backup (keep data, stop future migration attempts)
+    conn.execute("ALTER TABLE chat_history RENAME TO chat_history_backup")
+    conn.commit()
+    logger.info(f"Migration complete: {migrated}/{old_count} records migrated. "
+                 f"Old table renamed to chat_history_backup.")
 
 
 def _write_worker():
@@ -224,6 +361,33 @@ def search_history(query: str, limit: int = 5, max_chars: int = 4000) -> list[di
                 d = dict(row)
                 if (d["conversation_id"], d["created_at"]) not in seen:
                     results.append(d)
+
+        # Also search legacy chat_history_backup if it still exists and we need more
+        if len(results) < limit and _table_exists(conn, "chat_history_backup"):
+            try:
+                # Detect content column name in backup table
+                backup_cols = _get_table_columns(conn, "chat_history_backup")
+                c_col = "content" if "content" in backup_cols else (
+                    "message" if "message" in backup_cols else None)
+                t_col = "created_at" if "created_at" in backup_cols else (
+                    "timestamp" if "timestamp" in backup_cols else None)
+                r_col = "role" if "role" in backup_cols else None
+                if c_col:
+                    legacy_sql = f"""SELECT
+                        {f'{r_col}' if r_col else "'user'"} as role,
+                        {c_col} as content,
+                        {t_col if t_col else "'unknown'"} as created_at,
+                        'legacy' as conversation_id
+                        FROM chat_history_backup
+                        WHERE {c_col} LIKE ?
+                        ORDER BY rowid DESC LIMIT ?"""
+                    legacy_rows = conn.execute(
+                        legacy_sql, (f"%{query}%", limit - len(results))
+                    ).fetchall()
+                    for row in legacy_rows:
+                        results.append(dict(row))
+            except Exception as e:
+                logger.debug(f"Legacy search failed (ok to ignore): {e}")
 
         # Trim total chars
         trimmed = []
