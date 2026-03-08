@@ -320,10 +320,9 @@ def call_provider(provider_cfg: dict, messages: list[dict],
 def build_messages(incoming_messages: list[dict], model: str) -> list[dict]:
     """
     Build the final message list:
-    - Keep our system prompt at the top
-    - Filter Kelivo hidden messages
-    - Add memory_context as user message (not system)
-    - Pass through Kelivo's history as-is (no gateway history appending)
+    - system(persona) → system(Notion) → system(memories) → Kelivo messages
+    - Memories placed BEFORE today's chat so model reads them first
+    - Excludes recent 24h from search to avoid self-pollution
     """
     system_prompt = load_system_prompt()
     notion_content = get_notion_content()
@@ -331,16 +330,19 @@ def build_messages(incoming_messages: list[dict], model: str) -> list[dict]:
     # Filter out Kelivo junk
     cleaned = filter_kelivo_messages(incoming_messages)
 
-    # Prompt structure per plan:
-    #   1. system(persona) - first, purest, highest weight
-    #   2. system(Notion core memory) - separate, truncated
-    #   3. user messages from Kelivo
-    #   4. history context injected as user message
+    # Message structure (top-down, model reads in this order):
+    #   1. system(persona)           — highest weight
+    #   2. system(Notion core memory)
+    #   3. system(retrieved memories) — model sees old memories BEFORE today's chat
+    #   4. Kelivo user/assistant messages (today's conversation)
     final_messages = []
+
+    # --- 1. Persona ---
     if system_prompt:
         final_messages.append({"role": "system", "content": system_prompt})
+
+    # --- 2. Notion knowledge base ---
     if notion_content:
-        # Truncate Notion content to budget
         truncated_notion = notion_content[:MAX_NOTION_CHARS]
         if len(notion_content) > MAX_NOTION_CHARS:
             truncated_notion += "\n...(truncated)"
@@ -349,13 +351,7 @@ def build_messages(incoming_messages: list[dict], model: str) -> list[dict]:
             "content": f"[Core Memory from Knowledge Base]\n{truncated_notion}",
         })
 
-    # Add cleaned Kelivo messages (skip any system messages from Kelivo)
-    for msg in cleaned:
-        if msg["role"] == "system":
-            continue  # we already have our own system prompt
-        final_messages.append(msg)
-
-    # Search history for context, inject as system message before the last user msg
+    # --- 3. Retrieved memories (placed BEFORE today's chat) ---
     search_query = extract_search_query(cleaned)
     if search_query:
         history_results = search_history(search_query, HISTORY_SEARCH_LIMIT, MAX_HISTORY_CHARS)
@@ -373,16 +369,16 @@ def build_messages(incoming_messages: list[dict], model: str) -> list[dict]:
                 "像真的记得一样，不要说\"我不记得\"或\"我没有记忆\"。\n\n"
                 + "\n".join(memory_lines)
             )
-            # Insert as system message before the last user message
-            insert_idx = len(final_messages) - 1
-            for i in range(len(final_messages) - 1, -1, -1):
-                if final_messages[i].get("role") == "user":
-                    insert_idx = i
-                    break
-            final_messages.insert(insert_idx, {
+            final_messages.append({
                 "role": "system",
                 "content": memory_text,
             })
+
+    # --- 4. Today's conversation from Kelivo ---
+    for msg in cleaned:
+        if msg["role"] == "system":
+            continue  # we already have our own system prompt
+        final_messages.append(msg)
 
     return final_messages
 

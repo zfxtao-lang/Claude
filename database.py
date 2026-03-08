@@ -359,15 +359,23 @@ def _build_like_conditions(keywords: list[str], column: str = "content") -> tupl
     return " AND ".join(clauses), params
 
 
-def search_history(query: str, limit: int = 5, max_chars: int = 4000) -> list[dict]:
+def search_history(query: str, limit: int = 5, max_chars: int = 4000,
+                   exclude_recent_hours: int = 24) -> list[dict]:
     """
     Search message history.
     Priority: jieba tokenized multi-keyword LIKE (works for Chinese),
     then FTS5 as fallback (works for English/indexed content).
+
+    exclude_recent_hours: skip messages from the last N hours to avoid
+    polluting results with today's "I don't remember" responses.
     """
     conn = get_db()
     results = []
     seen = set()
+
+    # Time cutoff: exclude messages newer than this
+    cutoff = (datetime.now() - timedelta(hours=exclude_recent_hours)).strftime("%Y-%m-%d %H:%M:%S")
+    time_filter = "created_at < ?"
 
     def _add_rows(rows):
         for row in rows:
@@ -386,10 +394,10 @@ def search_history(query: str, limit: int = 5, max_chars: int = 4000) -> list[di
         if all_keywords:
             # First try exact query match
             exact_rows = conn.execute(
-                """SELECT role, content, created_at, conversation_id
-                   FROM messages WHERE content LIKE ?
-                   ORDER BY created_at DESC LIMIT ?""",
-                (f"%{query}%", limit)
+                f"""SELECT role, content, created_at, conversation_id
+                    FROM messages WHERE content LIKE ? AND {time_filter}
+                    ORDER BY created_at DESC LIMIT ?""",
+                (f"%{query}%", cutoff, limit)
             ).fetchall()
             _add_rows(exact_rows)
 
@@ -398,9 +406,9 @@ def search_history(query: str, limit: int = 5, max_chars: int = 4000) -> list[di
                 where_sql, params = _build_like_conditions(keywords)
                 kw_rows = conn.execute(
                     f"""SELECT role, content, created_at, conversation_id
-                        FROM messages WHERE {where_sql}
+                        FROM messages WHERE {where_sql} AND {time_filter}
                         ORDER BY created_at DESC LIMIT ?""",
-                    params + [limit - len(results)]
+                    params + [cutoff, limit - len(results)]
                 ).fetchall()
                 _add_rows(kw_rows)
 
@@ -412,10 +420,10 @@ def search_history(query: str, limit: int = 5, max_chars: int = 4000) -> list[di
                     if len(kw) < 2:
                         continue  # skip single-char tokens for noise reduction
                     single_rows = conn.execute(
-                        """SELECT role, content, created_at, conversation_id
-                           FROM messages WHERE content LIKE ?
-                           ORDER BY created_at DESC LIMIT ?""",
-                        (f"%{kw}%", limit - len(results))
+                        f"""SELECT role, content, created_at, conversation_id
+                            FROM messages WHERE content LIKE ? AND {time_filter}
+                            ORDER BY created_at DESC LIMIT ?""",
+                        (f"%{kw}%", cutoff, limit - len(results))
                     ).fetchall()
                     _add_rows(single_rows)
 
@@ -426,13 +434,13 @@ def search_history(query: str, limit: int = 5, max_chars: int = 4000) -> list[di
             if safe_fts_query:
                 try:
                     fts_rows = conn.execute(
-                        """SELECT m.role, m.content, m.created_at, m.conversation_id
-                           FROM messages_fts f
-                           JOIN messages m ON m.conversation_id = f.conversation_id
-                           WHERE messages_fts MATCH ?
-                           ORDER BY m.created_at DESC
-                           LIMIT ?""",
-                        (safe_fts_query, limit - len(results))
+                        f"""SELECT m.role, m.content, m.created_at, m.conversation_id
+                            FROM messages_fts f
+                            JOIN messages m ON m.conversation_id = f.conversation_id
+                            WHERE messages_fts MATCH ? AND m.{time_filter}
+                            ORDER BY m.created_at DESC
+                            LIMIT ?""",
+                        (safe_fts_query, cutoff, limit - len(results))
                     ).fetchall()
                     _add_rows(fts_rows)
                 except Exception:
@@ -448,16 +456,19 @@ def search_history(query: str, limit: int = 5, max_chars: int = 4000) -> list[di
                     "timestamp" if "timestamp" in backup_cols else None)
                 r_col = "role" if "role" in backup_cols else None
                 if c_col:
+                    # Legacy table may not have timestamp, add time filter only if possible
+                    time_clause = f" AND {t_col} < ?" if t_col else ""
+                    time_params = [cutoff] if t_col else []
                     legacy_sql = f"""SELECT
                         {f'{r_col}' if r_col else "'user'"} as role,
                         {c_col} as content,
                         {t_col if t_col else "'unknown'"} as created_at,
                         'legacy' as conversation_id
                         FROM chat_history_backup
-                        WHERE {c_col} LIKE ?
+                        WHERE {c_col} LIKE ?{time_clause}
                         ORDER BY rowid DESC LIMIT ?"""
                     legacy_rows = conn.execute(
-                        legacy_sql, (f"%{query}%", limit - len(results))
+                        legacy_sql, [f"%{query}%"] + time_params + [limit - len(results)]
                     ).fetchall()
                     _add_rows(legacy_rows)
             except Exception as e:
