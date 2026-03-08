@@ -32,6 +32,27 @@ def jieba_tokenize(text: str) -> str:
     return " ".join(w.strip() for w in words if w.strip())
 
 
+def _sanitize_fts5_query(tokenized: str) -> str:
+    """
+    Escape a jieba-tokenized string so it is safe for FTS5 MATCH.
+
+    FTS5 operators/special chars: " * ~ - ( ) OR AND NOT NEAR
+    Strategy: wrap every token in double-quotes so FTS5 treats it as a literal.
+    Tokens that themselves contain a double-quote get that quote doubled (FTS5 escaping).
+    Skip tokens that are pure punctuation / empty.
+    """
+    tokens = tokenized.split()
+    safe = []
+    for t in tokens:
+        # Skip pure punctuation / whitespace tokens
+        if not t or re.fullmatch(r'[\s\W]+', t):
+            continue
+        # Double any internal double-quotes, then wrap in quotes
+        escaped = t.replace('"', '""')
+        safe.append(f'"{escaped}"')
+    return " ".join(safe)
+
+
 def get_db() -> sqlite3.Connection:
     """Get a database connection with WAL mode enabled."""
     conn = sqlite3.connect(DB_PATH, timeout=10)
@@ -332,17 +353,23 @@ def search_history(query: str, limit: int = 5, max_chars: int = 4000) -> list[di
     try:
         # FTS5 search with jieba tokenization
         tokenized_query = jieba_tokenize(query)
-        if tokenized_query:
-            fts_rows = conn.execute(
-                """SELECT m.role, m.content, m.created_at, m.conversation_id
-                   FROM messages_fts f
-                   JOIN messages m ON m.conversation_id = f.conversation_id
-                        AND m.content LIKE '%' || ? || '%'
-                   WHERE messages_fts MATCH ?
-                   ORDER BY m.created_at DESC
-                   LIMIT ?""",
-                (query[:20], tokenized_query, limit)
-            ).fetchall()
+        safe_fts_query = _sanitize_fts5_query(tokenized_query) if tokenized_query else ""
+        if safe_fts_query:
+            try:
+                fts_rows = conn.execute(
+                    """SELECT m.role, m.content, m.created_at, m.conversation_id
+                       FROM messages_fts f
+                       JOIN messages m ON m.conversation_id = f.conversation_id
+                            AND m.content LIKE '%' || ? || '%'
+                       WHERE messages_fts MATCH ?
+                       ORDER BY m.created_at DESC
+                       LIMIT ?""",
+                    (query[:20], safe_fts_query, limit)
+                ).fetchall()
+            except Exception:
+                # If FTS still fails (corrupt index, etc.), fall through to LIKE
+                logger.warning("FTS5 query failed, falling back to LIKE", exc_info=True)
+                fts_rows = []
             for row in fts_rows:
                 results.append(dict(row))
 
