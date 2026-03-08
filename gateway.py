@@ -15,6 +15,7 @@ Fixes applied:
 """
 import json
 import logging
+import os
 import re
 import threading
 import time
@@ -42,8 +43,9 @@ from config import (
     reload_providers,
 )
 from database import (
-    backup_database, build_pending_chunks, get_chunks_by_ids, get_unembedded_chunks,
-    init_db, mark_chunks_embedded, save_message, search_history, start_writer,
+    backup_database, build_pending_chunks, get_chunks_by_ids, get_neighbor_chunks,
+    get_unembedded_chunks, init_db, mark_chunks_embedded, save_message,
+    search_history, start_writer,
 )
 from embedding import (
     get_embedding, get_embeddings_batch, vector_store,
@@ -101,12 +103,25 @@ _embedding_thread.start()
 
 
 # ---------- Vector Search ----------
+VECTOR_MIN_SCORE = float(os.getenv("VECTOR_MIN_SCORE", "0.2"))
+VECTOR_NEIGHBOR_WINDOW = int(os.getenv("VECTOR_NEIGHBOR_WINDOW", "1"))
+
+
 def vector_search_memories(query: str, top_k: int = 5,
-                           min_score: float = 0.3) -> list[dict]:
+                           min_score: float = None) -> list[dict]:
     """
-    Search memories using vector similarity.
-    Returns list of chunk dicts with content, sorted by relevance.
+    Search memories using vector similarity + context expansion.
+
+    1. Find top_k most similar chunks
+    2. For each matched chunk, also pull ±VECTOR_NEIGHBOR_WINDOW neighboring
+       chunks from the same conversation (restores full topic context)
+    3. Merge and deduplicate, sorted by conversation → time order
+
+    Returns list of chunk dicts with content.
     """
+    if min_score is None:
+        min_score = VECTOR_MIN_SCORE
+
     if vector_store.size == 0:
         logger.info("[Vector] store empty, skipping vector search")
         return []
@@ -121,19 +136,35 @@ def vector_search_memories(query: str, top_k: int = 5,
     good_results = [(cid, score) for cid, score in results if score >= min_score]
 
     if not good_results:
-        logger.info(f"[Vector] no results above min_score={min_score} "
-                    f"(best: {results[0][1]:.3f} if any)")
+        best = f"{results[0][1]:.3f}" if results else "N/A"
+        logger.info(f"[Vector] no results above min_score={min_score} (best: {best})")
         return []
 
-    chunk_ids = [cid for cid, _ in good_results]
+    matched_ids = [cid for cid, _ in good_results]
     scores = {cid: score for cid, score in good_results}
-    chunks = get_chunks_by_ids(chunk_ids)
 
-    for c in chunks:
-        c["score"] = scores.get(c["id"], 0)
-
-    logger.info(f"[Vector] found {len(chunks)} chunks, "
+    logger.info(f"[Vector] matched {len(matched_ids)} chunks, "
                 f"scores: {[f'{s:.3f}' for _, s in good_results]}")
+
+    # Context expansion: pull in neighboring chunks from same conversations
+    if VECTOR_NEIGHBOR_WINDOW > 0:
+        chunks = get_neighbor_chunks(matched_ids, window=VECTOR_NEIGHBOR_WINDOW)
+        expanded = len(chunks) - len(matched_ids)
+        if expanded > 0:
+            logger.info(f"[Vector] context expansion: +{expanded} neighbor chunks "
+                        f"(window=±{VECTOR_NEIGHBOR_WINDOW}), total={len(chunks)}")
+    else:
+        chunks = get_chunks_by_ids(matched_ids)
+
+    # Attach scores (neighbors get a "context" marker)
+    for c in chunks:
+        if c["id"] in scores:
+            c["score"] = scores[c["id"]]
+            c["match_type"] = "direct"
+        else:
+            c["score"] = 0.0
+            c["match_type"] = "context"
+
     return chunks
 
 
@@ -444,16 +475,35 @@ def build_messages(incoming_messages: list[dict], model: str) -> list[dict]:
     memory_lines = []
 
     if search_query:
-        # Primary: vector search (understands meaning, not just keywords)
+        # Primary: vector search (semantic + context expansion)
         vector_chunks = vector_search_memories(search_query, top_k=HISTORY_SEARCH_LIMIT)
         if vector_chunks:
+            # Group chunks by conversation for coherent presentation
+            from collections import OrderedDict
+            conv_groups: dict[str, list[dict]] = OrderedDict()
             for vc in vector_chunks:
-                date = vc.get("created_at", "")[:10]
-                score = vc.get("score", 0)
-                # Chunk content already has "role: content" format
-                content = (vc.get("content", "") or "")[:500]
-                memory_lines.append(f"[{date} 相关度:{score:.0%}]\n{content}")
-            logger.info(f"[Memory] vector search: {len(vector_chunks)} chunks")
+                cid = vc.get("conversation_id", "?")
+                if cid not in conv_groups:
+                    conv_groups[cid] = []
+                conv_groups[cid].append(vc)
+
+            for conv_id, chunks in conv_groups.items():
+                # Sort chunks within conversation by message order
+                chunks.sort(key=lambda c: c.get("msg_id_start", 0))
+                # Combine chunks from same conversation into one memory block
+                parts = []
+                for vc in chunks:
+                    content = (vc.get("content", "") or "")[:600]
+                    parts.append(content)
+                date = chunks[0].get("created_at", "")[:10]
+                best_score = max(c.get("score", 0) for c in chunks)
+                combined = "\n".join(parts)
+                memory_lines.append(f"[{date} 相关度:{best_score:.0%}]\n{combined}")
+
+            direct = sum(1 for vc in vector_chunks if vc.get("match_type") == "direct")
+            context = sum(1 for vc in vector_chunks if vc.get("match_type") == "context")
+            logger.info(f"[Memory] vector search: {direct} direct + {context} context "
+                        f"= {len(vector_chunks)} chunks, {len(conv_groups)} conversations")
 
         # Fallback: LIKE keyword search (catches what vectors miss)
         if len(memory_lines) < HISTORY_SEARCH_LIMIT:

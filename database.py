@@ -678,6 +678,57 @@ def get_chunks_by_ids(chunk_ids: list[int]) -> list[dict]:
         conn.close()
 
 
+def get_neighbor_chunks(chunk_ids: list[int], window: int = 1) -> list[dict]:
+    """
+    Given a list of matched chunk IDs, also fetch neighboring chunks
+    from the same conversation (±window chunks by id order).
+
+    This expands recall: if chunk 5 matched, also return chunks 4 and 6
+    from the same conversation, giving complete topic context.
+
+    Returns all chunks (original + neighbors), deduplicated, sorted by
+    (conversation_id, msg_id_start).
+    """
+    if not chunk_ids:
+        return []
+    conn = get_db()
+    try:
+        # Get conversation_ids and id ranges for the matched chunks
+        placeholders = ",".join("?" * len(chunk_ids))
+        matched = conn.execute(
+            f"""SELECT id, conversation_id FROM vector_chunks
+                WHERE id IN ({placeholders})""",
+            chunk_ids
+        ).fetchall()
+
+        # For each matched chunk, find neighbors in the same conversation
+        all_ids = set(chunk_ids)
+        for row in matched:
+            conv_id = row["conversation_id"]
+            chunk_id = row["id"]
+            neighbors = conn.execute(
+                """SELECT id FROM vector_chunks
+                   WHERE conversation_id = ?
+                   AND id BETWEEN ? AND ?
+                   ORDER BY id""",
+                (conv_id, chunk_id - window, chunk_id + window)
+            ).fetchall()
+            for n in neighbors:
+                all_ids.add(n["id"])
+
+        # Fetch all chunks (matched + neighbors)
+        all_placeholders = ",".join("?" * len(all_ids))
+        rows = conn.execute(
+            f"""SELECT id, conversation_id, content, msg_id_start, msg_id_end, created_at
+                FROM vector_chunks WHERE id IN ({all_placeholders})
+                ORDER BY conversation_id, msg_id_start""",
+            list(all_ids)
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
 def get_all_chunks_for_rebuild() -> list[dict]:
     """Get all chunks for full vector rebuild."""
     conn = get_db()
