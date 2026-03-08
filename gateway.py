@@ -288,7 +288,10 @@ def extract_search_query(messages: list[dict], max_msgs: int = 5) -> str:
             keywords.append(t)
 
     # Cap at ~15 keywords to avoid overly broad queries
-    return " ".join(keywords[:15])
+    query = " ".join(keywords[:15])
+    logger.info(f"[Memory] search_query extracted: '{query}' "
+                f"(from {len(recent_texts)} recent msgs, latest={len(latest)} chars)")
+    return query
 
 
 # ---------- Provider Call (all OpenAI-compatible) ----------
@@ -352,9 +355,12 @@ def build_messages(incoming_messages: list[dict], model: str) -> list[dict]:
         })
 
     # --- 3. Retrieved memories (placed BEFORE today's chat) ---
+    memory_inject_idx = len(final_messages)  # track where memory goes
     search_query = extract_search_query(cleaned)
     if search_query:
         history_results = search_history(search_query, HISTORY_SEARCH_LIMIT, MAX_HISTORY_CHARS)
+        logger.info(f"[Memory] search_history returned {len(history_results)} results "
+                    f"for query: '{search_query[:80]}'")
         if history_results:
             memory_lines = []
             for h in history_results:
@@ -373,12 +379,23 @@ def build_messages(incoming_messages: list[dict], model: str) -> list[dict]:
                 "role": "system",
                 "content": memory_text,
             })
+            logger.info(f"[Memory] injected at position {memory_inject_idx} "
+                        f"(before Kelivo messages), {len(memory_lines)} memory lines")
+    else:
+        logger.info("[Memory] no search_query extracted, skipping memory retrieval")
 
     # --- 4. Today's conversation from Kelivo ---
+    kelivo_start_idx = len(final_messages)
     for msg in cleaned:
         if msg["role"] == "system":
             continue  # we already have our own system prompt
         final_messages.append(msg)
+
+    # --- Final structure log ---
+    roles_summary = [f"{i}:{m['role']}" for i, m in enumerate(final_messages)]
+    logger.info(f"[Memory] build_messages final: {len(final_messages)} msgs, "
+                f"memory@{memory_inject_idx} kelivo@{kelivo_start_idx} | "
+                f"{' '.join(roles_summary)}")
 
     return final_messages
 

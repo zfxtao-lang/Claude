@@ -376,6 +376,8 @@ def search_history(query: str, limit: int = 5, max_chars: int = 4000,
     # Time cutoff: exclude messages newer than this
     cutoff = (datetime.now() - timedelta(hours=exclude_recent_hours)).strftime("%Y-%m-%d %H:%M:%S")
     time_filter = "created_at < ?"
+    logger.info(f"[Memory] search_history called: query='{query[:80]}', "
+                f"limit={limit}, cutoff={cutoff}")
 
     def _add_rows(rows):
         for row in rows:
@@ -392,6 +394,8 @@ def search_history(query: str, limit: int = 5, max_chars: int = 4000,
         all_keywords = list(dict.fromkeys([query] + keywords))  # dedup, preserve order
 
         if all_keywords:
+            logger.info(f"[Memory] keywords: {keywords[:10]}")
+
             # First try exact query match
             exact_rows = conn.execute(
                 f"""SELECT role, content, created_at, conversation_id
@@ -400,6 +404,7 @@ def search_history(query: str, limit: int = 5, max_chars: int = 4000,
                 (f"%{query}%", cutoff, limit)
             ).fetchall()
             _add_rows(exact_rows)
+            logger.info(f"[Memory] phase1-exact: {len(exact_rows)} rows, total={len(results)}")
 
             # Then try multi-keyword AND match (jieba tokens)
             if len(results) < limit and len(keywords) > 1:
@@ -411,6 +416,7 @@ def search_history(query: str, limit: int = 5, max_chars: int = 4000,
                     params + [cutoff, limit - len(results)]
                 ).fetchall()
                 _add_rows(kw_rows)
+                logger.info(f"[Memory] phase1-multi-kw: {len(kw_rows)} rows, total={len(results)}")
 
             # Then try individual keywords (broader recall)
             if len(results) < limit and len(keywords) > 1:
@@ -426,6 +432,7 @@ def search_history(query: str, limit: int = 5, max_chars: int = 4000,
                         (f"%{kw}%", cutoff, limit - len(results))
                     ).fetchall()
                     _add_rows(single_rows)
+                logger.info(f"[Memory] phase1-single-kw: total={len(results)}")
 
         # --- Phase 2: FTS5 fallback (useful for English / already-indexed content) ---
         if len(results) < limit:
@@ -443,8 +450,9 @@ def search_history(query: str, limit: int = 5, max_chars: int = 4000,
                         (safe_fts_query, cutoff, limit - len(results))
                     ).fetchall()
                     _add_rows(fts_rows)
+                    logger.info(f"[Memory] phase2-fts5: {len(fts_rows)} rows, total={len(results)}")
                 except Exception:
-                    logger.warning("FTS5 query failed", exc_info=True)
+                    logger.warning("[Memory] phase2-fts5 failed", exc_info=True)
 
         # --- Phase 3: legacy backup table ---
         if len(results) < limit and _table_exists(conn, "chat_history_backup"):
@@ -483,6 +491,14 @@ def search_history(query: str, limit: int = 5, max_chars: int = 4000,
                 break
             trimmed.append(r)
             total += len(c)
+
+        if trimmed:
+            dates = [r.get("created_at", "?")[:10] for r in trimmed]
+            logger.info(f"[Memory] search_history returning {len(trimmed)} results "
+                        f"({total} chars), dates: {dates}")
+        else:
+            logger.info(f"[Memory] search_history returning 0 results "
+                        f"(pre-trim had {len(results)})")
         return trimmed
     finally:
         conn.close()
