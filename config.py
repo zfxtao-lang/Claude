@@ -8,25 +8,32 @@ from dotenv import load_dotenv
 load_dotenv()  # Load .env file
 
 # ---------- API Providers ----------
-# Each provider: name -> {base_url, api_key, models[], timeout}
+# Each provider: name -> {base_url, api_key, prefixes[], timeout}
+# Model routing uses prefix matching: model "anthropic/claude-3" matches prefix "anthropic/"
 PROVIDERS = {
-    "openai": {
-        "base_url": os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
-        "api_key": os.getenv("OPENAI_API_KEY", ""),
-        "models": ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-3.5-turbo"],
-        "timeout": int(os.getenv("OPENAI_TIMEOUT", "120")),
-    },
-    "anthropic": {
-        "base_url": os.getenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com/v1"),
-        "api_key": os.getenv("ANTHROPIC_API_KEY", ""),
-        "models": ["claude-sonnet-4-20250514", "claude-haiku-4-5-20251001", "claude-opus-4-20250514"],
-        "timeout": int(os.getenv("ANTHROPIC_TIMEOUT", "120")),
+    "openrouter": {
+        "base_url": os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
+        "api_key": os.getenv("OPENROUTER_API_KEY", ""),
+        "prefixes": ["anthropic/", "openai/", "google/"],
+        "timeout": int(os.getenv("OPENROUTER_TIMEOUT", "120")),
     },
     "deepseek": {
         "base_url": os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"),
         "api_key": os.getenv("DEEPSEEK_API_KEY", ""),
-        "models": ["deepseek-chat", "deepseek-reasoner"],
+        "prefixes": ["deepseek-"],
         "timeout": int(os.getenv("DEEPSEEK_TIMEOUT", "120")),
+    },
+    "zhipu": {
+        "base_url": os.getenv("ZHIPU_BASE_URL", "https://open.bigmodel.cn/api/paas/v4"),
+        "api_key": os.getenv("ZHIPU_API_KEY", ""),
+        "prefixes": ["glm-"],
+        "timeout": int(os.getenv("ZHIPU_TIMEOUT", "120")),
+    },
+    "alibaba": {
+        "base_url": os.getenv("ALIBABA_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+        "api_key": os.getenv("ALIBABA_API_KEY", ""),
+        "prefixes": ["qwen-"],
+        "timeout": int(os.getenv("ALIBABA_TIMEOUT", "120")),
     },
 }
 
@@ -66,10 +73,11 @@ API_RETRY_BACKOFF = float(os.getenv("API_RETRY_BACKOFF", "1.0"))  # seconds
 
 
 def get_provider_for_model(model: str) -> dict | None:
-    """Find which provider handles a given model name."""
+    """Find which provider handles a given model name (prefix matching)."""
     for name, cfg in PROVIDERS.items():
-        if model in cfg["models"]:
-            return {"provider": name, **cfg}
+        for prefix in cfg["prefixes"]:
+            if model.startswith(prefix):
+                return {"provider": name, **cfg}
     return None
 
 

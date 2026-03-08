@@ -106,7 +106,7 @@ def health():
     for name, cfg in PROVIDERS.items():
         provider_status[name] = {
             "configured": bool(cfg["api_key"]),
-            "models": cfg["models"],
+            "prefixes": cfg["prefixes"],
         }
     return jsonify({
         "status": "ok",
@@ -165,10 +165,13 @@ def extract_latest_user_message(messages: list[dict]) -> str:
     return ""
 
 
-# ---------- Provider Adapters ----------
-def call_openai_compatible(provider_cfg: dict, messages: list[dict],
-                           model: str, stream: bool, **kwargs) -> requests.Response:
-    """Call OpenAI-compatible API (works for OpenAI, DeepSeek, etc.)."""
+# ---------- Provider Call (all OpenAI-compatible) ----------
+def call_provider(provider_cfg: dict, messages: list[dict],
+                  model: str, stream: bool, **kwargs) -> requests.Response:
+    """
+    Call any OpenAI-compatible API.
+    Works for OpenRouter, DeepSeek, Zhipu, Alibaba - they all use /chat/completions.
+    """
     url = f"{provider_cfg['base_url']}/chat/completions"
     headers = {
         "Authorization": f"Bearer {provider_cfg['api_key']}",
@@ -185,106 +188,6 @@ def call_openai_compatible(provider_cfg: dict, messages: list[dict],
         timeout=provider_cfg["timeout"],
         stream=stream,
     )
-
-
-def call_anthropic(provider_cfg: dict, messages: list[dict],
-                    model: str, stream: bool, **kwargs) -> requests.Response:
-    """Call Anthropic API and return OpenAI-compatible response."""
-    url = f"{provider_cfg['base_url']}/messages"
-    headers = {
-        "x-api-key": provider_cfg["api_key"],
-        "anthropic-version": "2023-06-01",
-        "Content-Type": "application/json",
-    }
-    # Separate system messages
-    system_parts = [m["content"] for m in messages if m["role"] == "system"]
-    non_system = [m for m in messages if m["role"] != "system"]
-
-    body = {
-        "model": model,
-        "messages": non_system,
-        "max_tokens": kwargs.get("max_tokens", 4096),
-    }
-    if system_parts:
-        body["system"] = "\n\n".join(system_parts)
-    if stream:
-        body["stream"] = True
-
-    return requests.post(
-        url, headers=headers, json=body,
-        timeout=provider_cfg["timeout"],
-        stream=stream,
-    )
-
-
-def adapt_anthropic_response(resp_json: dict) -> dict:
-    """Convert Anthropic response to OpenAI format for Kelivo."""
-    content_blocks = resp_json.get("content", [])
-    text = "".join(b.get("text", "") for b in content_blocks if b.get("type") == "text")
-
-    return {
-        "id": resp_json.get("id", f"chatcmpl-{uuid.uuid4().hex[:12]}"),
-        "object": "chat.completion",
-        "created": int(time.time()),
-        "model": resp_json.get("model", ""),
-        "choices": [{
-            "index": 0,
-            "message": {"role": "assistant", "content": text},
-            "finish_reason": "stop",
-        }],
-        "usage": {
-            "prompt_tokens": resp_json.get("usage", {}).get("input_tokens", 0),
-            "completion_tokens": resp_json.get("usage", {}).get("output_tokens", 0),
-            "total_tokens": (
-                resp_json.get("usage", {}).get("input_tokens", 0) +
-                resp_json.get("usage", {}).get("output_tokens", 0)
-            ),
-        },
-    }
-
-
-def adapt_anthropic_stream_chunk(line: str) -> str | None:
-    """Convert Anthropic SSE stream chunk to OpenAI SSE format."""
-    if not line.startswith("data: "):
-        return None
-    data = line[6:]
-    if data.strip() == "[DONE]":
-        return "data: [DONE]\n\n"
-    try:
-        event = json.loads(data)
-    except json.JSONDecodeError:
-        return None
-
-    event_type = event.get("type", "")
-
-    if event_type == "content_block_delta":
-        delta = event.get("delta", {})
-        text = delta.get("text", "")
-        if text:
-            chunk = {
-                "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
-                "object": "chat.completion.chunk",
-                "created": int(time.time()),
-                "choices": [{
-                    "index": 0,
-                    "delta": {"content": text},
-                    "finish_reason": None,
-                }],
-            }
-            return f"data: {json.dumps(chunk)}\n\n"
-    elif event_type == "message_stop":
-        chunk = {
-            "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
-            "object": "chat.completion.chunk",
-            "created": int(time.time()),
-            "choices": [{
-                "index": 0,
-                "delta": {},
-                "finish_reason": "stop",
-            }],
-        }
-        return f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n"
-    return None
 
 
 # ---------- Build Messages ----------
@@ -407,10 +310,7 @@ def chat_completions():
     last_error = None
     for attempt in range(API_MAX_RETRIES + 1):
         try:
-            if provider_name == "anthropic":
-                resp = call_anthropic(provider_cfg, messages, model, stream, **extra)
-            else:
-                resp = call_openai_compatible(provider_cfg, messages, model, stream, **extra)
+            resp = call_provider(provider_cfg, messages, model, stream, **extra)
 
             if resp.status_code != 200:
                 error_body = resp.text
@@ -446,31 +346,17 @@ def chat_completions():
                 for line in resp.iter_lines(decode_unicode=True):
                     if not line:
                         continue
-                    if provider_name == "anthropic":
-                        adapted = adapt_anthropic_stream_chunk(line)
-                        if adapted:
-                            # Collect text for storage
-                            if '"content":' in adapted and "[DONE]" not in adapted:
-                                try:
-                                    chunk_data = json.loads(adapted[6:].strip())
-                                    delta = chunk_data.get("choices", [{}])[0].get("delta", {})
-                                    if "content" in delta:
-                                        assistant_text.append(delta["content"])
-                                except (json.JSONDecodeError, IndexError):
-                                    pass
-                            yield adapted
-                    else:
-                        # OpenAI-compatible: pass through
-                        yield line + "\n\n" if not line.endswith("\n\n") else line
-                        # Collect text
-                        if line.startswith("data: ") and "[DONE]" not in line:
-                            try:
-                                chunk_data = json.loads(line[6:])
-                                delta = chunk_data.get("choices", [{}])[0].get("delta", {})
-                                if "content" in delta:
-                                    assistant_text.append(delta["content"])
-                            except (json.JSONDecodeError, IndexError):
-                                pass
+                    # All providers are OpenAI-compatible: pass through SSE
+                    yield line + "\n\n" if not line.endswith("\n\n") else line
+                    # Collect text for DB storage
+                    if line.startswith("data: ") and "[DONE]" not in line:
+                        try:
+                            chunk_data = json.loads(line[6:])
+                            delta = chunk_data.get("choices", [{}])[0].get("delta", {})
+                            if "content" in delta:
+                                assistant_text.append(delta["content"])
+                        except (json.JSONDecodeError, IndexError):
+                            pass
             finally:
                 # Save assistant response
                 full_text = "".join(assistant_text)
@@ -489,11 +375,7 @@ def chat_completions():
     # ---------- Non-streaming response ----------
     raw_json = resp.json()
     logger.info(f"Raw API response keys: {list(raw_json.keys())}")
-
-    if provider_name == "anthropic":
-        result = adapt_anthropic_response(raw_json)
-    else:
-        result = raw_json
+    result = raw_json
 
     # Extract and save assistant reply
     assistant_content = ""
@@ -516,18 +398,17 @@ def chat_completions():
 @app.route("/v1/models", methods=["GET"])
 @require_auth
 def list_models():
-    """Return available models across all providers."""
-    models = []
+    """Return available providers and their supported prefixes."""
+    providers = []
     for name, cfg in PROVIDERS.items():
         if not cfg["api_key"]:
             continue
-        for m in cfg["models"]:
-            models.append({
-                "id": m,
-                "object": "model",
-                "owned_by": name,
-            })
-    return jsonify({"object": "list", "data": models})
+        providers.append({
+            "provider": name,
+            "prefixes": cfg["prefixes"],
+            "base_url": cfg["base_url"],
+        })
+    return jsonify({"object": "list", "data": providers})
 
 
 # ---------- Notion Cache Management ----------
