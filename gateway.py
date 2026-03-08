@@ -15,6 +15,7 @@ Fixes applied:
 """
 import json
 import logging
+import re
 import time
 import uuid
 from collections import defaultdict
@@ -118,12 +119,51 @@ def health():
 
 
 # ---------- Message Filtering (Kelivo cleanup) ----------
+
+# Regex to strip Kelivo's injected "tool guide" preamble from user/system messages.
+# Matches blocks like "你是一个无状态的大模型...工具说明...使用指南..." up to the
+# first real user content or end of text.  Keeps actual tool_call parameters intact.
+_KELIVO_TOOL_GUIDE_PATTERNS = [
+    # "你是一个无状态的大模型..." block (greedy up to a blank line or end)
+    re.compile(
+        r'你是一个无状态的.*?(?=\n\n|\Z)',
+        re.DOTALL,
+    ),
+    # "## 工具使用指南" / "## Tool Guide" style markdown sections
+    re.compile(
+        r'#{1,3}\s*(?:工具使用指南|工具说明|Tool Guide|Tool Instructions).*?(?=\n#{1,3}\s|\Z)',
+        re.DOTALL,
+    ),
+    # "以下是你可以使用的工具" / "Available tools:" intro paragraphs
+    re.compile(
+        r'(?:以下是你可以使用的工具|以下是可用的工具|Available tools)[：:].*?(?=\n\n|\Z)',
+        re.DOTALL,
+    ),
+    # Generic "你没有记忆能力" / "你无法记住之前的对话" anti-memory statements
+    re.compile(
+        r'(?:你没有记忆能力|你无法记住|你不具备记忆|每次对话都是全新的|你没有任何关于用户的记忆).*?(?=\n|\Z)',
+        re.DOTALL,
+    ),
+]
+
+
+def _strip_kelivo_tool_guide(text: str) -> str:
+    """Remove Kelivo's injected tool-guide preamble from message content."""
+    result = text
+    for pat in _KELIVO_TOOL_GUIDE_PATTERNS:
+        result = pat.sub('', result)
+    # Collapse leftover blank lines
+    result = re.sub(r'\n{3,}', '\n\n', result).strip()
+    return result
+
+
 def filter_kelivo_messages(messages: list[dict]) -> list[dict]:
     """
-    Filter out Kelivo's hidden system messages:
-    - Memory Tool injections
-    - Empty content messages
-    - Duplicate system prompts (keep only our own)
+    Filter out Kelivo's hidden system messages and strip tool-guide preambles:
+    - Remove Memory Tool injections (entire message)
+    - Strip "你是一个无状态的大模型..." tool guides from message content
+    - Remove empty content messages
+    - Skip duplicate system prompts (keep only our own)
     """
     filtered = []
     for msg in messages:
@@ -132,8 +172,18 @@ def filter_kelivo_messages(messages: list[dict]) -> list[dict]:
 
         # Handle content that's a list (multimodal messages with images)
         if isinstance(content, list):
-            # Keep image messages as-is
-            filtered.append(msg)
+            # Strip tool guide from text parts
+            new_parts = []
+            for part in content:
+                if part.get("type") == "text" and part.get("text"):
+                    cleaned_text = _strip_kelivo_tool_guide(part["text"])
+                    if cleaned_text:
+                        new_parts.append({**part, "text": cleaned_text})
+                    # drop empty text parts
+                else:
+                    new_parts.append(part)
+            if new_parts:
+                filtered.append({**msg, "content": new_parts})
             continue
 
         content_str = str(content).strip() if content else ""
@@ -142,7 +192,7 @@ def filter_kelivo_messages(messages: list[dict]) -> list[dict]:
         if not content_str:
             continue
 
-        # Skip Kelivo Memory Tool hidden messages
+        # Skip Kelivo Memory Tool hidden messages (entire message)
         if role == "system" and any(kw in content_str for kw in [
             "Memory Tool", "memory_tool", "MEMORY:", "<memory>",
             "User preferences:", "Previous context:"
@@ -150,7 +200,13 @@ def filter_kelivo_messages(messages: list[dict]) -> list[dict]:
             logger.info("Filtered out Kelivo Memory Tool message")
             continue
 
-        filtered.append(msg)
+        # Strip tool-guide preamble from content
+        cleaned_content = _strip_kelivo_tool_guide(content_str)
+        if not cleaned_content:
+            logger.info(f"Filtered out Kelivo tool-guide-only {role} message")
+            continue
+
+        filtered.append({**msg, "content": cleaned_content})
     return filtered
 
 
