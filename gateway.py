@@ -231,7 +231,7 @@ def build_messages(incoming_messages: list[dict], model: str) -> list[dict]:
             continue  # we already have our own system prompt
         final_messages.append(msg)
 
-    # Search history for context, inject as user message before the last user msg
+    # Search history for context, inject as system message before the last user msg
     user_query = extract_latest_user_message(cleaned)
     if user_query:
         history_results = search_history(user_query, HISTORY_SEARCH_LIMIT, MAX_HISTORY_CHARS)
@@ -239,22 +239,24 @@ def build_messages(incoming_messages: list[dict], model: str) -> list[dict]:
             memory_lines = []
             for h in history_results:
                 date = h.get("created_at", "")[:10]
-                role = h.get("role", "")
+                role_label = "淘淘" if h.get("role") == "user" else "你"
                 snippet = (h.get("content", "") or "")[:200]
-                memory_lines.append(f"[{date}] {role}: {snippet}")
+                memory_lines.append(f"[{date}] {role_label}: {snippet}")
             memory_text = (
-                "[Historical context from previous conversations - "
-                "use as reference only, prioritize current conversation]\n"
+                "【你和淘淘的真实对话记忆】\n"
+                "以下是你和淘淘之前真实发生过的对话，是你们共同的记忆。\n"
+                "回答时如果与这些记忆相关，必须自然地引用这些内容，"
+                "像真的记得一样，不要说\"我不记得\"或\"我没有记忆\"。\n\n"
                 + "\n".join(memory_lines)
             )
-            # Insert before the last user message
+            # Insert as system message before the last user message
             insert_idx = len(final_messages) - 1
             for i in range(len(final_messages) - 1, -1, -1):
                 if final_messages[i].get("role") == "user":
                     insert_idx = i
                     break
             final_messages.insert(insert_idx, {
-                "role": "user",
+                "role": "system",
                 "content": memory_text,
             })
 
