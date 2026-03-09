@@ -380,11 +380,16 @@ def extract_latest_user_message(messages: list[dict]) -> str:
 
 def _extract_msg_text(msg: dict) -> str:
     """Extract plain text from a message (handles both str and multimodal list)."""
+    import re
     content = msg.get("content", "")
     if isinstance(content, list):
         texts = [p.get("text", "") for p in content if p.get("type") == "text"]
-        return " ".join(texts).strip()
-    return str(content).strip() if content else ""
+        raw = " ".join(texts).strip()
+    else:
+        raw = str(content).strip() if content else ""
+    # Strip <image_file_ocr>...</image_file_ocr> tags so they don't pollute search queries
+    raw = re.sub(r"<image_file_ocr>.*?</image_file_ocr>", "", raw, flags=re.DOTALL).strip()
+    return raw
 
 
 def extract_search_query(messages: list[dict], max_msgs: int = 5) -> str:
