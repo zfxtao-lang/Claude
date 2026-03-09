@@ -24,6 +24,8 @@ from collections import defaultdict
 from functools import wraps
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry as Urllib3Retry
 from flask import Flask, Response, jsonify, request, stream_with_context
 
 import config
@@ -63,6 +65,16 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+# ---------- Persistent HTTP Session with connection pooling ----------
+_http_session = requests.Session()
+_adapter = HTTPAdapter(
+    pool_connections=10,
+    pool_maxsize=20,
+    max_retries=0,  # We handle retries ourselves
+)
+_http_session.mount("https://", _adapter)
+_http_session.mount("http://", _adapter)
 
 init_db()
 start_writer()  # Start async DB write thread
@@ -494,6 +506,7 @@ def call_provider(provider_cfg: dict, messages: list[dict],
     """
     Call any OpenAI-compatible API.
     Works for OpenRouter, DeepSeek, Zhipu, Alibaba - they all use /chat/completions.
+    Uses persistent session with connection pooling for stability.
     """
     url = f"{provider_cfg['base_url']}/chat/completions"
     headers = {
@@ -506,9 +519,11 @@ def call_provider(provider_cfg: dict, messages: list[dict],
         "stream": stream,
         **kwargs,
     }
-    return requests.post(
+    # Separate connect timeout (10s) from read timeout (provider-configured)
+    read_timeout = provider_cfg["timeout"]
+    return _http_session.post(
         url, headers=headers, json=body,
-        timeout=provider_cfg["timeout"],
+        timeout=(10, read_timeout),
         stream=stream,
     )
 
@@ -790,7 +805,7 @@ def chat_completions():
         if key in data:
             extra[key] = data[key]
 
-    # Call API with retry
+    # Call API with retry (retries on 5xx, 429, timeout, connection errors)
     last_error = None
     for attempt in range(API_MAX_RETRIES + 1):
         try:
@@ -798,23 +813,33 @@ def chat_completions():
 
             if resp.status_code != 200:
                 error_body = resp.text
-                logger.error(f"API error {resp.status_code}: {error_body}")
-                if resp.status_code >= 500 and attempt < API_MAX_RETRIES:
-                    time.sleep(API_RETRY_BACKOFF * (2 ** attempt))
+                logger.error(f"API error {resp.status_code} (attempt {attempt + 1}): "
+                             f"{error_body[:300]}")
+                # Retry on server errors (5xx) and rate limiting (429)
+                if (resp.status_code >= 500 or resp.status_code == 429) \
+                        and attempt < API_MAX_RETRIES:
+                    # Respect Retry-After header from provider if present
+                    retry_after = resp.headers.get("Retry-After")
+                    if retry_after and resp.status_code == 429:
+                        wait = min(float(retry_after), 30)
+                    else:
+                        wait = API_RETRY_BACKOFF * (2 ** attempt)
+                    logger.info(f"Retrying in {wait:.1f}s...")
+                    time.sleep(wait)
                     continue
                 return jsonify({"error": {"message": error_body,
                                           "type": "api_error"}}), resp.status_code
             break
         except requests.Timeout:
-            logger.error(f"API timeout (attempt {attempt + 1})")
+            logger.error(f"API timeout (attempt {attempt + 1}/{API_MAX_RETRIES + 1})")
             last_error = "API request timed out"
             if attempt < API_MAX_RETRIES:
                 time.sleep(API_RETRY_BACKOFF * (2 ** attempt))
                 continue
             return jsonify({"error": {"message": last_error,
                                       "type": "timeout_error"}}), 504
-        except requests.RequestException as e:
-            logger.error(f"API request failed: {e}")
+        except (requests.ConnectionError, requests.RequestException) as e:
+            logger.error(f"API connection error (attempt {attempt + 1}): {e}")
             last_error = str(e)
             if attempt < API_MAX_RETRIES:
                 time.sleep(API_RETRY_BACKOFF * (2 ** attempt))
@@ -844,8 +869,13 @@ def chat_completions():
                                 assistant_text.append(delta["content"])
                         except (json.JSONDecodeError, IndexError):
                             pass
+            except (requests.ConnectionError, requests.ChunkedEncodingError,
+                    ConnectionResetError, OSError) as e:
+                logger.error(f"Stream interrupted: {e}")
+                # Send an error event so the client knows the stream broke
+                yield f'data: {{"error": "Stream interrupted: {type(e).__name__}"}}\n\n'
             finally:
-                # Save assistant response
+                # Save whatever we got so far
                 full_text = "".join(assistant_text)
                 if full_text.strip():
                     save_message(conversation_id, "assistant", full_text,

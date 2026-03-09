@@ -87,8 +87,8 @@ CORS_ALLOWED_ORIGINS = os.getenv("CORS_ALLOWED_ORIGINS", "*").split(",")
 MAX_NOTION_CHARS = int(os.getenv("MAX_NOTION_CHARS", "6000"))  # truncate Notion content
 
 # ---------- Retry ----------
-API_MAX_RETRIES = int(os.getenv("API_MAX_RETRIES", "2"))
-API_RETRY_BACKOFF = float(os.getenv("API_RETRY_BACKOFF", "1.0"))  # seconds
+API_MAX_RETRIES = int(os.getenv("API_MAX_RETRIES", "3"))
+API_RETRY_BACKOFF = float(os.getenv("API_RETRY_BACKOFF", "1.5"))  # seconds
 
 
 def get_provider_for_model(model: str) -> dict | None:
