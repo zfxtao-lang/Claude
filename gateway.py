@@ -513,6 +513,54 @@ def call_provider(provider_cfg: dict, messages: list[dict],
     )
 
 
+# ---------- Multimodal Support ----------
+
+# Models/providers that support image_url in content
+_IMAGE_CAPABLE_PREFIXES = (
+    "anthropic/",    # Claude via OpenRouter
+    "openai/",       # GPT-4o via OpenRouter
+    "google/",       # Gemini via OpenRouter
+    "gpt-4o",        # direct
+    "claude",        # direct
+    "glm-4v",        # Zhipu vision model
+    "qwen-vl",       # Qwen vision model
+)
+
+
+def _model_supports_images(model: str) -> bool:
+    """Check if a model supports image_url content blocks."""
+    m = model.lower()
+    return any(m.startswith(p) or p in m for p in _IMAGE_CAPABLE_PREFIXES)
+
+
+def _strip_image_content(messages: list[dict]) -> list[dict]:
+    """
+    Remove image_url blocks from multimodal messages.
+    Converts list content to plain string if only text remains.
+    Drops messages entirely if they become empty after stripping.
+    """
+    result = []
+    for msg in messages:
+        content = msg.get("content", "")
+        if not isinstance(content, list):
+            result.append(msg)
+            continue
+
+        # Keep only text parts
+        text_parts = [p for p in content if p.get("type") == "text"]
+        if not text_parts:
+            # Image-only message, add placeholder
+            result.append({**msg, "content": "[图片]"})
+        elif len(text_parts) == 1:
+            # Single text part, simplify to string
+            result.append({**msg, "content": text_parts[0].get("text", "")})
+        else:
+            # Multiple text parts, keep as list
+            result.append({**msg, "content": text_parts})
+
+    return result
+
+
 # ---------- Build Messages ----------
 def build_messages(incoming_messages: list[dict], model: str) -> list[dict]:
     """
@@ -634,6 +682,10 @@ def build_messages(incoming_messages: list[dict], model: str) -> list[dict]:
         if msg["role"] == "system":
             continue  # we already have our own system prompt
         final_messages.append(msg)
+
+    # --- Strip image_url for text-only models ---
+    if not _model_supports_images(model):
+        final_messages = _strip_image_content(final_messages)
 
     # --- Final structure log ---
     roles_summary = [f"{i}:{m['role']}" for i, m in enumerate(final_messages)]
