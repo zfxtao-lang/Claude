@@ -535,10 +535,13 @@ _IMAGE_CAPABLE_PREFIXES = (
     "anthropic/",    # Claude via OpenRouter
     "openai/",       # GPT-4o via OpenRouter
     "google/",       # Gemini via OpenRouter
+    "meta-llama/",   # Llama vision models via OpenRouter
     "gpt-4o",        # direct
     "claude",        # direct
     "glm-4v",        # Zhipu vision model
     "qwen-vl",       # Qwen vision model
+    "qwen2.5-vl",    # Qwen2.5 vision model
+    "qwen-omni",     # Qwen omni model
 )
 
 
