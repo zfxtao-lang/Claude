@@ -539,6 +539,7 @@ _IMAGE_CAPABLE_PREFIXES = (
     "gpt-4o",        # direct
     "claude",        # direct
     "glm-4v",        # Zhipu vision model
+    "glm-5",         # Zhipu GLM-5 (multimodal)
     "qwen-vl",       # Qwen vision model
     "qwen2.5-vl",    # Qwen2.5 vision model
     "qwen-omni",     # Qwen omni model
