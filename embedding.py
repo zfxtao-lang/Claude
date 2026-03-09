@@ -201,5 +201,43 @@ class VectorStore:
         self.save()
 
 
-# Global instance
+CARD_VECTOR_FILE = os.getenv("CARD_VECTOR_FILE", "card_vectors.npy")
+CARD_VECTOR_IDS_FILE = os.getenv("CARD_VECTOR_IDS_FILE", "card_vectors_ids.npy")
+
+
+class CardVectorStore(VectorStore):
+    """Vector store specifically for memory cards. Same engine, separate files."""
+
+    def __init__(self):
+        super().__init__()
+
+    def _load(self):
+        if self._loaded:
+            return
+        with self._lock:
+            if self._loaded:
+                return
+            if os.path.exists(CARD_VECTOR_FILE) and os.path.exists(CARD_VECTOR_IDS_FILE):
+                try:
+                    self._vectors = np.load(CARD_VECTOR_FILE)
+                    self._chunk_ids = np.load(CARD_VECTOR_IDS_FILE)
+                    logger.info(f"[CardVector] loaded {len(self._chunk_ids)} card vectors from disk")
+                except Exception:
+                    logger.error("[CardVector] failed to load card vectors", exc_info=True)
+                    self._vectors = None
+                    self._chunk_ids = None
+            else:
+                logger.info("[CardVector] no card vector files found, starting empty")
+            self._loaded = True
+
+    def save(self):
+        with self._lock:
+            if self._vectors is not None and len(self._vectors) > 0:
+                np.save(CARD_VECTOR_FILE, self._vectors)
+                np.save(CARD_VECTOR_IDS_FILE, self._chunk_ids)
+                logger.info(f"[CardVector] saved {len(self._chunk_ids)} card vectors to disk")
+
+
+# Global instances
 vector_store = VectorStore()
+card_vector_store = CardVectorStore()

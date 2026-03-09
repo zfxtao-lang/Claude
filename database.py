@@ -143,6 +143,24 @@ def init_db():
             ON vector_chunks(has_embedding);
         CREATE INDEX IF NOT EXISTS idx_chunks_msg_range
             ON vector_chunks(msg_id_end);
+
+        -- Memory cards: AI-generated daily summaries for efficient retrieval
+        CREATE TABLE IF NOT EXISTS memory_cards (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            tags TEXT DEFAULT '',
+            conversation_ids TEXT DEFAULT '',
+            msg_id_start INTEGER DEFAULT 0,
+            msg_id_end INTEGER DEFAULT 0,
+            has_embedding INTEGER DEFAULT 0,
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_cards_date
+            ON memory_cards(date);
+        CREATE INDEX IF NOT EXISTS idx_cards_embedding
+            ON memory_cards(has_embedding);
     """)
     conn.commit()
 
@@ -737,6 +755,154 @@ def get_all_chunks_for_rebuild() -> list[dict]:
             "SELECT id, content FROM vector_chunks ORDER BY id"
         ).fetchall()
         return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+# ---------- Memory Cards ----------
+
+def get_messages_by_date(date: str) -> list[dict]:
+    """Get all messages for a specific date (YYYY-MM-DD)."""
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            """SELECT id, conversation_id, role, content, model, created_at
+               FROM messages
+               WHERE date(created_at) = ?
+               ORDER BY id""",
+            (date,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_dates_without_cards(start_date: str = None, end_date: str = None) -> list[str]:
+    """Get dates that have messages but no memory cards yet."""
+    conn = get_db()
+    try:
+        sql = """
+            SELECT DISTINCT date(created_at) as d
+            FROM messages
+            WHERE date(created_at) NOT IN (SELECT DISTINCT date FROM memory_cards)
+              AND content IS NOT NULL AND content != ''
+        """
+        params = []
+        if start_date:
+            sql += " AND date(created_at) >= ?"
+            params.append(start_date)
+        if end_date:
+            sql += " AND date(created_at) <= ?"
+            params.append(end_date)
+        sql += " ORDER BY d"
+        rows = conn.execute(sql, params).fetchall()
+        return [r[0] for r in rows if r[0]]
+    finally:
+        conn.close()
+
+
+def save_memory_card(date: str, summary: str, tags: str = "",
+                     conversation_ids: str = "",
+                     msg_id_start: int = 0, msg_id_end: int = 0) -> int:
+    """Save a memory card, returns the card ID."""
+    conn = get_db()
+    try:
+        cursor = conn.execute(
+            """INSERT INTO memory_cards
+               (date, summary, tags, conversation_ids, msg_id_start, msg_id_end)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (date, summary, tags, conversation_ids, msg_id_start, msg_id_end)
+        )
+        conn.commit()
+        return cursor.lastrowid
+    finally:
+        conn.close()
+
+
+def get_cards_by_date(date: str) -> list[dict]:
+    """Get all memory cards for a specific date."""
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM memory_cards WHERE date = ? ORDER BY id",
+            (date,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_unembedded_cards(limit: int = 50) -> list[dict]:
+    """Get cards that don't have embeddings yet."""
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            """SELECT id, summary FROM memory_cards
+               WHERE has_embedding = 0 ORDER BY id LIMIT ?""",
+            (limit,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def mark_cards_embedded(card_ids: list[int]):
+    """Mark cards as having embeddings."""
+    if not card_ids:
+        return
+    conn = get_db()
+    try:
+        placeholders = ",".join("?" * len(card_ids))
+        conn.execute(
+            f"UPDATE memory_cards SET has_embedding = 1 WHERE id IN ({placeholders})",
+            card_ids
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_cards_by_ids(card_ids: list[int]) -> list[dict]:
+    """Fetch memory cards by IDs."""
+    if not card_ids:
+        return []
+    conn = get_db()
+    try:
+        placeholders = ",".join("?" * len(card_ids))
+        rows = conn.execute(
+            f"SELECT * FROM memory_cards WHERE id IN ({placeholders})",
+            card_ids
+        ).fetchall()
+        id_to_row = {dict(r)["id"]: dict(r) for r in rows}
+        return [id_to_row[cid] for cid in card_ids if cid in id_to_row]
+    finally:
+        conn.close()
+
+
+def get_all_cards() -> list[dict]:
+    """Get all memory cards (for full rebuild)."""
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT id, summary FROM memory_cards ORDER BY id"
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_card_count() -> dict:
+    """Get memory card statistics."""
+    conn = get_db()
+    try:
+        total = conn.execute("SELECT COUNT(*) FROM memory_cards").fetchone()[0]
+        embedded = conn.execute(
+            "SELECT COUNT(*) FROM memory_cards WHERE has_embedding = 1"
+        ).fetchone()[0]
+        dates = conn.execute(
+            "SELECT COUNT(DISTINCT date) FROM memory_cards"
+        ).fetchone()[0]
+        return {"total": total, "embedded": embedded, "dates": dates}
     finally:
         conn.close()
 

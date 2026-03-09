@@ -48,7 +48,11 @@ from database import (
     search_history, start_writer,
 )
 from embedding import (
-    get_embedding, get_embeddings_batch, vector_store,
+    get_embedding, get_embeddings_batch, vector_store, card_vector_store,
+)
+from memory_cards import (
+    embed_pending_cards, generate_card_for_date, generate_cards_batch,
+    search_memory_cards,
 )
 from notion_cache import get_notion_content, invalidate_cache
 
@@ -552,33 +556,47 @@ def build_messages(incoming_messages: list[dict], model: str) -> list[dict]:
     memory_lines = []
 
     if raw_user_msg:
-        # --- Primary: vector search with original user message ---
-        logger.info(f"[Memory] vector query (raw): '{raw_user_msg[:80]}'")
-        vector_chunks = vector_search_memories(raw_user_msg, top_k=HISTORY_SEARCH_LIMIT)
-        if vector_chunks:
-            from collections import OrderedDict
-            conv_groups: dict[str, list[dict]] = OrderedDict()
-            for vc in vector_chunks:
-                cid = vc.get("conversation_id", "?")
-                if cid not in conv_groups:
-                    conv_groups[cid] = []
-                conv_groups[cid].append(vc)
+        # --- Layer 1: Memory cards (short, high-density, fast) ---
+        logger.info(f"[Memory] query (raw): '{raw_user_msg[:80]}'")
+        card_results = search_memory_cards(raw_user_msg, top_k=3)
+        if card_results:
+            for card in card_results:
+                date = card.get("date", "?")
+                score = card.get("score", 0)
+                summary = card.get("summary", "")
+                tags = card.get("tags", "")
+                tag_str = f" #{tags}" if tags else ""
+                memory_lines.append(f"[{date} 记忆卡片 相关度:{score:.0%}{tag_str}]\n{summary}")
+            logger.info(f"[Memory] card search: {len(card_results)} cards matched")
 
-            for conv_id, chunks in conv_groups.items():
-                chunks.sort(key=lambda c: c.get("msg_id_start", 0))
-                parts = []
-                for vc in chunks:
-                    content = (vc.get("content", "") or "")[:600]
-                    parts.append(content)
-                date = chunks[0].get("created_at", "")[:10]
-                best_score = max(c.get("score", 0) for c in chunks)
-                combined = "\n".join(parts)
-                memory_lines.append(f"[{date} 相关度:{best_score:.0%}]\n{combined}")
+        # --- Layer 2: Vector chunks (raw conversations, for what cards missed) ---
+        remaining_slots = HISTORY_SEARCH_LIMIT - len(memory_lines)
+        if remaining_slots > 0:
+            vector_chunks = vector_search_memories(raw_user_msg, top_k=remaining_slots)
+            if vector_chunks:
+                from collections import OrderedDict
+                conv_groups: dict[str, list[dict]] = OrderedDict()
+                for vc in vector_chunks:
+                    cid = vc.get("conversation_id", "?")
+                    if cid not in conv_groups:
+                        conv_groups[cid] = []
+                    conv_groups[cid].append(vc)
 
-            direct = sum(1 for vc in vector_chunks if vc.get("match_type") == "direct")
-            context = sum(1 for vc in vector_chunks if vc.get("match_type") == "context")
-            logger.info(f"[Memory] vector search: {direct} direct + {context} context "
-                        f"= {len(vector_chunks)} chunks, {len(conv_groups)} conversations")
+                for conv_id, chunks in conv_groups.items():
+                    chunks.sort(key=lambda c: c.get("msg_id_start", 0))
+                    parts = []
+                    for vc in chunks:
+                        content = (vc.get("content", "") or "")[:600]
+                        parts.append(content)
+                    date = chunks[0].get("created_at", "")[:10]
+                    best_score = max(c.get("score", 0) for c in chunks)
+                    combined = "\n".join(parts)
+                    memory_lines.append(f"[{date} 相关度:{best_score:.0%}]\n{combined}")
+
+                direct = sum(1 for vc in vector_chunks if vc.get("match_type") == "direct")
+                context = sum(1 for vc in vector_chunks if vc.get("match_type") == "context")
+                logger.info(f"[Memory] vector search: {direct} direct + {context} context "
+                            f"= {len(vector_chunks)} chunks, {len(conv_groups)} conversations")
 
         # --- Fallback: LIKE keyword search (jieba, for what vectors missed) ---
         if len(memory_lines) < HISTORY_SEARCH_LIMIT:
@@ -890,6 +908,109 @@ def reload_providers_endpoint():
 
 
 # ---------- Vector Admin ----------
+# ---------- Memory Card Admin ----------
+@app.route("/admin/cards/generate", methods=["POST"])
+@require_auth
+def cards_generate():
+    """
+    Generate memory cards for specified dates.
+
+    Body params:
+      date: single date (YYYY-MM-DD) - generate for one day
+      start_date / end_date: date range - batch generate
+      force: bool - regenerate even if card exists
+    """
+    data = request.get_json(force=True) if request.is_json else {}
+    single_date = data.get("date")
+    start_date = data.get("start_date")
+    end_date = data.get("end_date")
+    force = data.get("force", False)
+
+    def _run():
+        try:
+            if single_date:
+                card = generate_card_for_date(single_date, force=force)
+                if card:
+                    # Also embed immediately
+                    embed_pending_cards()
+                logger.info(f"[MemoryCard] single generate done: {single_date}")
+            else:
+                cards = generate_cards_batch(start_date, end_date, force=force)
+                if cards:
+                    embed_pending_cards()
+                logger.info(f"[MemoryCard] batch generate done: {len(cards) if not single_date else 1} cards")
+        except Exception:
+            logger.error("[MemoryCard] generate failed", exc_info=True)
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+
+    return jsonify({
+        "status": "started",
+        "date": single_date,
+        "start_date": start_date,
+        "end_date": end_date,
+        "force": force,
+    })
+
+
+@app.route("/admin/cards/embed", methods=["POST"])
+@require_auth
+def cards_embed():
+    """Embed all unembedded memory cards."""
+    def _run():
+        count = embed_pending_cards()
+        logger.info(f"[MemoryCard] embed done: {count} cards")
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    return jsonify({"status": "started"})
+
+
+@app.route("/admin/cards/status", methods=["GET"])
+@require_auth
+def cards_status():
+    """Show memory card statistics."""
+    from database import get_card_count
+    stats = get_card_count()
+    stats["card_vector_store_size"] = card_vector_store.size
+    return jsonify(stats)
+
+
+@app.route("/admin/cards/list", methods=["GET"])
+@require_auth
+def cards_list():
+    """List memory cards, optionally filtered by date."""
+    date = request.args.get("date")
+    if date:
+        from database import get_cards_by_date
+        cards = get_cards_by_date(date)
+    else:
+        from database import get_all_cards
+        cards = get_all_cards()
+    return jsonify({"cards": cards, "count": len(cards)})
+
+
+@app.route("/admin/cards/search", methods=["POST"])
+@require_auth
+def cards_search():
+    """Test memory card search."""
+    data = request.get_json(force=True) if request.is_json else {}
+    query = data.get("query", "")
+    if not query:
+        return jsonify({"error": "query required"}), 400
+
+    cards = search_memory_cards(query, top_k=5)
+    return jsonify({
+        "query": query,
+        "results": [
+            {"date": c["date"], "summary": c["summary"],
+             "tags": c.get("tags", ""), "score": round(c.get("score", 0), 3)}
+            for c in cards
+        ],
+    })
+
+
 @app.route("/admin/vectors/status", methods=["GET"])
 @require_auth
 def vectors_status():
@@ -903,12 +1024,16 @@ def vectors_status():
         ).fetchone()[0]
         pending = total_chunks - embedded
         total_msgs = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+        from database import get_card_count
+        card_stats = get_card_count()
         return jsonify({
             "vector_store_size": vector_store.size,
             "total_chunks": total_chunks,
             "embedded_chunks": embedded,
             "pending_chunks": pending,
             "total_messages": total_msgs,
+            "memory_cards": card_stats,
+            "card_vector_store_size": card_vector_store.size,
         })
     finally:
         conn.close()
@@ -992,6 +1117,10 @@ def vectors_nightly():
     def _run():
         count = _do_nightly_vectorize()
         logger.info(f"[Vector] nightly job done: {count} chunks embedded")
+        # Also embed any pending memory cards
+        card_count = embed_pending_cards()
+        if card_count:
+            logger.info(f"[Vector] nightly: also embedded {card_count} memory cards")
 
     t = threading.Thread(target=_run, daemon=True)
     t.start()
