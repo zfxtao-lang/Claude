@@ -343,6 +343,11 @@ def filter_kelivo_messages(messages: list[dict]) -> list[dict]:
 
         content_str = str(content).strip() if content else ""
 
+        # Preserve tool-related messages as-is (function calling flow)
+        if role == "tool" or msg.get("tool_calls") or msg.get("tool_call_id"):
+            filtered.append(msg)
+            continue
+
         # Skip empty messages
         if not content_str:
             continue
@@ -838,7 +843,8 @@ def chat_completions():
     # Extra params to pass through
     extra = {}
     for key in ["temperature", "max_tokens", "top_p", "frequency_penalty",
-                "presence_penalty", "stop"]:
+                "presence_penalty", "stop",
+                "tools", "tool_choice"]:
         if key in data:
             extra[key] = data[key]
 
