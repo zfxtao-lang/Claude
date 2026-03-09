@@ -494,6 +494,8 @@ def _format_memory_for_model(model: str, memory_content: str) -> str:
             "These are your shared memories. When relevant to the current question, "
             "reference these naturally as if you truly remember. "
             "Never say you don't have memory or can't remember.\n"
+            "IMPORTANT: Each memory has a date and how long ago it was. "
+            "Pay close attention to the time — do NOT treat old memories as recent events.\n"
             "</instructions>\n"
             "<conversations>\n"
             f"{memory_content}\n"
@@ -505,7 +507,9 @@ def _format_memory_for_model(model: str, memory_content: str) -> str:
             "【你和淘淘的真实对话记忆】\n"
             "以下是你和淘淘之前真实发生过的对话，是你们共同的记忆。\n"
             "回答时如果与这些记忆相关，必须自然地引用这些内容，"
-            "像真的记得一样，不要说\"我不记得\"或\"我没有记忆\"。\n\n"
+            "像真的记得一样，不要说\"我不记得\"或\"我没有记忆\"。\n"
+            "注意：每条记忆都标注了日期和距今天数，请务必关注时间，"
+            "不要把很久以前的事当成最近发生的。\n\n"
             f"{memory_content}"
         )
 
@@ -633,6 +637,21 @@ def build_messages(incoming_messages: list[dict], model: str) -> list[dict]:
     memory_lines = []
 
     if raw_user_msg:
+        # helper: calculate days ago from a YYYY-MM-DD string
+        def _days_ago(date_str: str) -> str:
+            from datetime import datetime
+            try:
+                d = datetime.strptime(date_str[:10], "%Y-%m-%d")
+                delta = (datetime.now() - d).days
+                if delta == 0:
+                    return "今天"
+                elif delta == 1:
+                    return "昨天"
+                else:
+                    return f"{delta}天前"
+            except (ValueError, TypeError):
+                return ""
+
         # --- Layer 1: Memory cards (short, high-density, fast) ---
         logger.info(f"[Memory] query (raw): '{raw_user_msg[:80]}'")
         card_results = search_memory_cards(raw_user_msg, top_k=3)
@@ -643,7 +662,9 @@ def build_messages(incoming_messages: list[dict], model: str) -> list[dict]:
                 summary = card.get("summary", "")
                 tags = card.get("tags", "")
                 tag_str = f" #{tags}" if tags else ""
-                memory_lines.append(f"[{date} 记忆卡片 相关度:{score:.0%}{tag_str}]\n{summary}")
+                ago = _days_ago(date)
+                ago_str = f"({ago}) " if ago else ""
+                memory_lines.append(f"[{date} {ago_str}记忆卡片 相关度:{score:.0%}{tag_str}]\n{summary}")
             logger.info(f"[Memory] card search: {len(card_results)} cards matched")
 
         # --- Layer 2: Vector chunks (raw conversations, for what cards missed) ---
@@ -668,7 +689,9 @@ def build_messages(incoming_messages: list[dict], model: str) -> list[dict]:
                     date = chunks[0].get("created_at", "")[:10]
                     best_score = max(c.get("score", 0) for c in chunks)
                     combined = "\n".join(parts)
-                    memory_lines.append(f"[{date} 相关度:{best_score:.0%}]\n{combined}")
+                    ago = _days_ago(date)
+                    ago_str = f"({ago}) " if ago else ""
+                    memory_lines.append(f"[{date} {ago_str}相关度:{best_score:.0%}]\n{combined}")
 
                 direct = sum(1 for vc in vector_chunks if vc.get("match_type") == "direct")
                 context = sum(1 for vc in vector_chunks if vc.get("match_type") == "context")
@@ -687,7 +710,9 @@ def build_messages(incoming_messages: list[dict], model: str) -> list[dict]:
                     date = h.get("created_at", "")[:10]
                     role_label = "淘淘" if h.get("role") == "user" else "你"
                     snippet = (h.get("content", "") or "")[:200]
-                    memory_lines.append(f"[{date}] {role_label}: {snippet}")
+                    ago = _days_ago(date)
+                    ago_str = f"({ago}) " if ago else ""
+                    memory_lines.append(f"[{date} {ago_str}] {role_label}: {snippet}")
 
         # --- Inject memories with model-specific format ---
         if memory_lines:
