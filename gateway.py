@@ -769,6 +769,22 @@ def chat_completions():
     logger.info(f"Request: model={model}, stream={stream}, "
                 f"messages_count={len(incoming_messages)}")
 
+    # Debug: log multimodal message structure (to diagnose image/OCR issues)
+    for i, msg in enumerate(incoming_messages):
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            parts_summary = []
+            for p in content:
+                ptype = p.get("type", "?")
+                if ptype == "text":
+                    parts_summary.append(f"text({len(p.get('text', ''))}chars)")
+                elif ptype == "image_url":
+                    url = p.get("image_url", {}).get("url", "")
+                    parts_summary.append(f"image({url[:30]}...)" if len(url) > 30 else f"image({url})")
+                else:
+                    parts_summary.append(ptype)
+            logger.info(f"[Multimodal] msg[{i}] role={msg.get('role')} parts: {parts_summary}")
+
     # Intercept Kelivo internal summary requests - don't waste API calls
     if _is_kelivo_summary_request(incoming_messages):
         logger.info("Intercepted Kelivo summary request, returning empty summary")
