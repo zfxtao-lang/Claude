@@ -785,6 +785,18 @@ def chat_completions():
                     parts_summary.append(ptype)
             logger.info(f"[Multimodal] msg[{i}] role={msg.get('role')} parts: {parts_summary}")
 
+    # Debug: log last user message content (to see OCR tags from Kelivo)
+    for msg in reversed(incoming_messages):
+        if msg.get("role") == "user":
+            _content = msg.get("content", "")
+            if isinstance(_content, list):
+                _text_parts = [p.get("text", "") for p in _content if p.get("type") == "text"]
+                _preview = " | ".join(_text_parts)[:500]
+            else:
+                _preview = str(_content)[:500]
+            logger.info(f"[Debug] last user msg: {_preview}")
+            break
+
     # Intercept Kelivo internal summary requests - don't waste API calls
     if _is_kelivo_summary_request(incoming_messages):
         logger.info("Intercepted Kelivo summary request, returning empty summary")
@@ -885,7 +897,7 @@ def chat_completions():
                         try:
                             chunk_data = json.loads(line[6:])
                             delta = chunk_data.get("choices", [{}])[0].get("delta", {})
-                            if "content" in delta:
+                            if delta.get("content"):
                                 assistant_text.append(delta["content"])
                         except (json.JSONDecodeError, IndexError):
                             pass
