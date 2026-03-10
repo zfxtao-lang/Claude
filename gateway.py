@@ -658,7 +658,7 @@ def _call_vision_api(model: str, image_url: str, prompt: str) -> str:
                         "type": "image_url",
                         "image_url": {"url": image_url},
                         "min_pixels": 3072,
-                        "max_pixels": 8388608,
+                        "max_pixels": 1003520,
                     },
                     {"type": "text", "text": "Read all the text in the image."},
                 ],
