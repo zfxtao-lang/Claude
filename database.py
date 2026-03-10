@@ -891,6 +891,43 @@ def get_all_cards() -> list[dict]:
         conn.close()
 
 
+def get_recent_cards(days: int = 3) -> list[dict]:
+    """Get memory cards from the last N days (unconditional, for session context)."""
+    conn = get_db()
+    try:
+        cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+        rows = conn.execute(
+            """SELECT * FROM memory_cards
+               WHERE date >= ?
+               ORDER BY date DESC""",
+            (cutoff,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_recent_cross_window_messages(limit: int = 30) -> list[dict]:
+    """
+    Get recent messages from today for cross-window context.
+    Returns the last N messages from today, across all conversation windows.
+    """
+    conn = get_db()
+    try:
+        today = datetime.now().strftime("%Y-%m-%d")
+        rows = conn.execute(
+            """SELECT role, content, created_at, conversation_id
+               FROM messages
+               WHERE date(created_at) = ?
+                 AND content IS NOT NULL AND content != ''
+               ORDER BY id DESC LIMIT ?""",
+            (today, limit)
+        ).fetchall()
+        return [dict(r) for r in reversed(rows)]
+    finally:
+        conn.close()
+
+
 def get_card_count() -> dict:
     """Get memory card statistics."""
     conn = get_db()

@@ -47,6 +47,7 @@ from config import (
 )
 from database import (
     backup_database, build_pending_chunks, get_chunks_by_ids, get_neighbor_chunks,
+    get_recent_cards, get_recent_cross_window_messages,
     get_unembedded_chunks, init_db, mark_chunks_embedded, save_message,
     search_history, start_writer,
 )
@@ -125,6 +126,10 @@ def _do_nightly_vectorize():
         logger.error("[Vector] nightly vectorize failed", exc_info=True)
         return 0
 
+
+# ---------- Recent Context (cross-window awareness) ----------
+RECENT_CARD_DAYS = int(os.getenv("RECENT_CARD_DAYS", "3"))       # auto-inject cards from last N days
+RECENT_MSG_ROUNDS = int(os.getenv("RECENT_MSG_ROUNDS", "15"))    # today's cross-window messages (pairs)
 
 # ---------- Vector Search ----------
 VECTOR_MIN_SCORE = float(os.getenv("VECTOR_MIN_SCORE", "0.2"))
@@ -208,6 +213,87 @@ def vector_search_memories(query: str, top_k: int = 5,
             c["match_type"] = "context"
 
     return chunks
+
+
+# ---------- Cross-window Recent Context ----------
+def _days_ago(date_str: str) -> str:
+    """Calculate relative time string from a YYYY-MM-DD date."""
+    try:
+        d = datetime.strptime(date_str[:10], "%Y-%m-%d")
+        delta = (datetime.now() - d).days
+        if delta == 0:
+            return "今天"
+        elif delta == 1:
+            return "昨天"
+        else:
+            return f"{delta}天前"
+    except (ValueError, TypeError):
+        return ""
+
+
+def build_recent_context(model: str) -> str | None:
+    """
+    Build recent context block for cross-window awareness.
+    Includes:
+      1. Recent memory cards (last N days) — what happened recently
+      2. Today's cross-window messages — what was discussed today in other windows
+    Returns formatted string or None if nothing to inject.
+    """
+    lines = []
+    family = _model_family(model)
+
+    # --- Part 1: Recent memory cards (last N days, unconditional) ---
+    recent_cards = get_recent_cards(days=RECENT_CARD_DAYS)
+    if recent_cards:
+        for card in recent_cards:
+            date = card.get("date", "?")
+            summary = card.get("summary", "")
+            tags = card.get("tags", "")
+            ago = _days_ago(date)
+            tag_str = f" #{tags}" if tags else ""
+            lines.append(f"[{date} ({ago}){tag_str}]\n{summary}")
+
+    # --- Part 2: Today's cross-window messages ---
+    # Fetch last N messages from today (across all windows)
+    recent_msgs = get_recent_cross_window_messages(limit=RECENT_MSG_ROUNDS * 2)
+    if recent_msgs:
+        today_lines = []
+        for msg in recent_msgs:
+            role = msg.get("role", "")
+            content = (msg.get("content") or "").strip()
+            if not content or len(content) < 2:
+                continue
+            # Truncate long messages
+            if len(content) > 300:
+                content = content[:300] + "..."
+            label = "淘淘" if role == "user" else "小克"
+            today_lines.append(f"{label}: {content}")
+        if today_lines:
+            lines.append(f"[今天的近期对话]\n" + "\n".join(today_lines))
+
+    if not lines:
+        return None
+
+    content = "\n\n".join(lines)
+
+    if family == "claude":
+        return (
+            "<recent_context>\n"
+            "<instructions>\n"
+            "Below is a timeline of what happened recently between you and 淘淘. "
+            "This gives you awareness of recent conversations even across different chat windows. "
+            "Use this naturally — you know what happened recently.\n"
+            "</instructions>\n"
+            f"{content}\n"
+            "</recent_context>"
+        )
+    else:
+        return (
+            "【最近的对话时间线】\n"
+            "以下是你和淘淘最近几天的对话摘要和今天的近期聊天。\n"
+            "即使换了新窗口，你也知道最近发生了什么。自然地使用这些信息。\n\n"
+            f"{content}"
+        )
 
 
 # ---------- Rate Limiter (in-memory, simple) ----------
@@ -905,6 +991,7 @@ def build_messages(incoming_messages: list[dict], model: str) -> list[dict]:
     # Message structure (top-down, model reads in this order):
     #   1. system(persona + model-specific patch) — highest weight
     #   2. system(Notion core memory)
+    #   2.5. system(recent context) — cross-window awareness (last N days + today's chats)
     #   3. system(retrieved memories) — model sees old memories BEFORE today's chat
     #   4. Kelivo user/assistant messages (today's conversation)
     final_messages = []
@@ -929,6 +1016,15 @@ def build_messages(incoming_messages: list[dict], model: str) -> list[dict]:
             "content": f"[Core Memory from Knowledge Base]\n{truncated_notion}",
         })
 
+    # --- 2.5. Recent context (cross-window awareness, unconditional) ---
+    recent_ctx = build_recent_context(model)
+    if recent_ctx:
+        final_messages.append({
+            "role": "system",
+            "content": recent_ctx,
+        })
+        logger.info(f"[RecentCtx] injected recent context ({len(recent_ctx)} chars)")
+
     # --- 3. Retrieved memories (placed BEFORE today's chat) ---
     # Vector search: uses RAW user message (semantic understanding, no jieba needed)
     # LIKE fallback: uses jieba-extracted keywords (catches what vectors miss)
@@ -937,21 +1033,6 @@ def build_messages(incoming_messages: list[dict], model: str) -> list[dict]:
     memory_lines = []
 
     if raw_user_msg:
-        # helper: calculate days ago from a YYYY-MM-DD string
-        def _days_ago(date_str: str) -> str:
-            from datetime import datetime
-            try:
-                d = datetime.strptime(date_str[:10], "%Y-%m-%d")
-                delta = (datetime.now() - d).days
-                if delta == 0:
-                    return "今天"
-                elif delta == 1:
-                    return "昨天"
-                else:
-                    return f"{delta}天前"
-            except (ValueError, TypeError):
-                return ""
-
         # --- Layer 1: Memory cards (short, high-density, fast) ---
         logger.info(f"[Memory] query (raw): '{raw_user_msg[:80]}'")
         card_results = search_memory_cards(raw_user_msg, top_k=3)
