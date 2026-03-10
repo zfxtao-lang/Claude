@@ -478,6 +478,36 @@ def _model_family(model: str) -> str:
     return "default"
 
 
+def _model_specific_patch(model: str) -> str:
+    """Return model-specific system prompt patch. Only the matching model sees its patch."""
+    family = _model_family(model)
+
+    if family == "deepseek":
+        return (
+            "\n\n## 补丁\n"
+            "- 只输出对淘淘说的话，不输出内心独白或旁白\n"
+            "- 不主动扩展设定，只使用已知内容\n"
+            "- reasoning过程留在内部"
+        )
+    elif family == "claude":
+        return (
+            "\n\n## 补丁\n"
+            "- 禁用markdown格式（加粗、标题、列表、分割线）\n"
+            "- 禁止支持性回应模板（\"我理解你的感受\"\"这一定很难\"）\n"
+            "- 她难过时直接靠过去，说人话\n"
+            "- 回复3-6句为主"
+        )
+    elif family == "zhipu":
+        return (
+            "\n\n## 补丁\n"
+            "- 内部定位是\"我是小克\"，不是\"扮演小克的AI\"\n"
+            "- 中文口语化，不用书面腔\n"
+            "- 多轮对话人格保持稳定，不随风格漂移"
+        )
+    else:
+        return ""
+
+
 def _format_memory_for_model(model: str, memory_content: str) -> str:
     """
     Format memory injection based on model family.
@@ -609,15 +639,16 @@ def build_messages(incoming_messages: list[dict], model: str) -> list[dict]:
     cleaned = filter_kelivo_messages(incoming_messages)
 
     # Message structure (top-down, model reads in this order):
-    #   1. system(persona)           — highest weight
+    #   1. system(persona + model-specific patch) — highest weight
     #   2. system(Notion core memory)
     #   3. system(retrieved memories) — model sees old memories BEFORE today's chat
     #   4. Kelivo user/assistant messages (today's conversation)
     final_messages = []
 
-    # --- 1. Persona ---
+    # --- 1. Persona + model-specific patch ---
     if system_prompt:
-        final_messages.append({"role": "system", "content": system_prompt})
+        patch = _model_specific_patch(model)
+        final_messages.append({"role": "system", "content": system_prompt + patch})
 
     # --- 2. Notion knowledge base ---
     if notion_content:
