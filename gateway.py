@@ -629,17 +629,19 @@ def _strip_image_content(messages: list[dict]) -> list[dict]:
 
 # Model used for OCR when target model can't handle images
 _OCR_MODEL = os.environ.get("OCR_MODEL", "qwen-vl-ocr")
+_VISION_MODEL = os.environ.get("VISION_MODEL", "qwen-vl-max")
 _OCR_TIMEOUT = 30  # seconds
+_OCR_MIN_LENGTH = 10  # below this, treat as "no text found" and fallback to vision
 
 
-def _call_ocr_model(image_url: str) -> str:
+def _call_vision_api(model: str, image_url: str, prompt: str) -> str:
     """
-    Call Qwen VL to describe/OCR an image.
-    Returns the text description, or empty string on failure.
+    Call a vision-capable model with an image and prompt.
+    Returns the text response, or empty string on failure.
     """
-    provider_cfg = get_provider_for_model(_OCR_MODEL)
+    provider_cfg = get_provider_for_model(model)
     if not provider_cfg:
-        logger.warning(f"[OCR] No provider found for OCR model {_OCR_MODEL}")
+        logger.warning(f"[Vision] No provider found for model {model}")
         return ""
 
     messages = [
@@ -647,7 +649,7 @@ def _call_ocr_model(image_url: str) -> str:
             "role": "user",
             "content": [
                 {"type": "image_url", "image_url": {"url": image_url}},
-                {"type": "text", "text": "请提取并描述这张图片的所有内容，包括文字、图表、表情等。"},
+                {"type": "text", "text": prompt},
             ],
         }
     ]
@@ -658,16 +660,47 @@ def _call_ocr_model(image_url: str) -> str:
             "Authorization": f"Bearer {provider_cfg['api_key']}",
             "Content-Type": "application/json",
         }
-        body = {"model": _OCR_MODEL, "messages": messages, "stream": False}
+        body = {"model": model, "messages": messages, "stream": False}
         resp = _http_session.post(url, headers=headers, json=body, timeout=(10, _OCR_TIMEOUT))
         resp.raise_for_status()
         data = resp.json()
         text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-        logger.info(f"[OCR] Got {len(text)} chars from {_OCR_MODEL}")
+        logger.info(f"[Vision] Got {len(text)} chars from {model}")
         return text.strip()
     except Exception as e:
-        logger.error(f"[OCR] Failed to call {_OCR_MODEL}: {e}")
+        logger.error(f"[Vision] Failed to call {model}: {e}")
         return ""
+
+
+def _call_ocr_model(image_url: str) -> str:
+    """
+    Two-stage image understanding:
+    1. Use qwen-vl-ocr to extract text from the image.
+    2. If OCR result is too short (likely a pure photo/meme with no text),
+       fallback to qwen-vl-max to describe the image content.
+    """
+    # Stage 1: OCR for text extraction
+    ocr_text = _call_vision_api(
+        _OCR_MODEL, image_url,
+        "请提取这张图片中的所有文字内容。",
+    )
+
+    if len(ocr_text) >= _OCR_MIN_LENGTH:
+        logger.info(f"[OCR] Stage 1 sufficient ({len(ocr_text)} chars), using OCR result")
+        return ocr_text
+
+    # Stage 2: Fallback to vision model for image description
+    logger.info(f"[OCR] Stage 1 too short ({len(ocr_text)} chars), falling back to {_VISION_MODEL}")
+    desc_text = _call_vision_api(
+        _VISION_MODEL, image_url,
+        "请详细描述这张图片的内容，包括场景、物体、人物、颜色、表情、文字等所有可见信息。",
+    )
+
+    if desc_text:
+        return desc_text
+
+    # If both failed but OCR had something, return that
+    return ocr_text
 
 
 def _ocr_images_for_text_model(messages: list[dict]) -> list[dict]:
