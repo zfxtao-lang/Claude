@@ -639,23 +639,27 @@ def _call_vision_api(model: str, image_url: str, prompt: str) -> str:
     Call a vision-capable model with an image and prompt.
     Returns the text response, or empty string on failure.
 
-    Note: qwen-vl-ocr requires a special format — the user prompt must be
-    exactly "Read all the text in the image." and any custom instructions
-    go in the system message.
+    Note: qwen-vl-ocr requires a specific format — no system message,
+    image_url block needs min_pixels/max_pixels, and text must be fixed.
     """
     provider_cfg = get_provider_for_model(model)
     if not provider_cfg:
         logger.warning(f"[Vision] No provider found for model {model}")
         return ""
 
-    # qwen-vl-ocr has a rigid API format requirement
+    # qwen-vl-ocr has a rigid API format: no system message,
+    # fixed text prompt, and min/max_pixels on image_url block
     if "vl-ocr" in model:
         messages = [
-            {"role": "system", "content": [{"type": "text", "text": prompt}]},
             {
                 "role": "user",
                 "content": [
-                    {"type": "image_url", "image_url": {"url": image_url}},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": image_url},
+                        "min_pixels": 3072,
+                        "max_pixels": 8388608,
+                    },
                     {"type": "text", "text": "Read all the text in the image."},
                 ],
             },
