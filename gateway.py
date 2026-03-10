@@ -632,6 +632,7 @@ _OCR_MODEL = os.environ.get("OCR_MODEL", "qwen-vl-ocr")
 _VISION_MODEL = os.environ.get("VISION_MODEL", "qwen-vl-max")
 _OCR_TIMEOUT = 30  # seconds
 _OCR_MIN_LENGTH = 10  # below this, treat as "no text found" and fallback to vision
+_OCR_MAX_CHARS = 3000  # max chars for OCR text to avoid blowing up context
 
 
 def _call_vision_api(model: str, image_url: str, prompt: str) -> str:
@@ -713,6 +714,14 @@ def _call_ocr_model(image_url: str) -> str:
         _OCR_MODEL, image_url,
         "Extract all visible text from the image. Keep the original reading order and layout structure. For document-type content, use markdown and latex format.",
     )
+
+    # Truncate to avoid blowing up downstream model context
+    if desc_text and len(desc_text) > _OCR_MAX_CHARS:
+        logger.info(f"[OCR] Truncating description from {len(desc_text)} to {_OCR_MAX_CHARS} chars")
+        desc_text = desc_text[:_OCR_MAX_CHARS] + "...(truncated)"
+    if ocr_text and len(ocr_text) > _OCR_MAX_CHARS:
+        logger.info(f"[OCR] Truncating OCR text from {len(ocr_text)} to {_OCR_MAX_CHARS} chars")
+        ocr_text = ocr_text[:_OCR_MAX_CHARS] + "...(truncated)"
 
     # Combine results
     if desc_text and ocr_text and len(ocr_text) >= _OCR_MIN_LENGTH:
