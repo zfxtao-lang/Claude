@@ -20,6 +20,7 @@ import re
 import threading
 import time
 import uuid
+from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 from functools import wraps
 
@@ -645,10 +646,15 @@ def build_messages(incoming_messages: list[dict], model: str) -> list[dict]:
     #   4. Kelivo user/assistant messages (today's conversation)
     final_messages = []
 
-    # --- 1. Persona + model-specific patch ---
+    # --- 1. Persona + model-specific patch + current time ---
     if system_prompt:
         patch = _model_specific_patch(model)
-        final_messages.append({"role": "system", "content": system_prompt + patch})
+        beijing_tz = timezone(timedelta(hours=8))
+        now_bj = datetime.now(beijing_tz)
+        weekdays = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+        now_str = now_bj.strftime("%-m月%-d日") + " " + weekdays[now_bj.weekday()] + " " + now_bj.strftime("%H:%M")
+        time_line = f"\n\n【当前时间】{now_str}"
+        final_messages.append({"role": "system", "content": system_prompt + patch + time_line})
 
     # --- 2. Notion knowledge base ---
     if notion_content:
