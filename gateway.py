@@ -1261,7 +1261,7 @@ def chat_completions():
                 yield f'data: {{"error": "Stream interrupted: {type(e).__name__}"}}\n\n'
             finally:
                 # Save whatever we got so far
-                full_text = "".join(assistant_text)
+                full_text = "".join(t for t in assistant_text if t is not None)
                 if full_text.strip():
                     save_message(conversation_id, "assistant", full_text,
                                 model, provider_name)
