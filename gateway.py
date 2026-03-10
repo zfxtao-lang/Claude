@@ -822,6 +822,71 @@ def _ocr_images_for_text_model(messages: list[dict]) -> list[dict]:
     return result
 
 
+# ---------- Context Window Management ----------
+
+# Rough chars-per-token ratio (Chinese ~2, English ~4, mixed ~2.5)
+_CHARS_PER_TOKEN = 2.5
+
+# Model context limits (tokens). Conservative to leave margin.
+_MODEL_CONTEXT_LIMITS = {
+    "deepseek": 64000,      # 131K official, but leave huge margin
+    "zhipu": 120000,        # GLM models
+    "qwen": 120000,         # Qwen models
+    "claude": 180000,       # Claude 200K
+    "default": 60000,       # safe default
+}
+
+
+def _model_max_context(model: str) -> int:
+    """Get the max context token limit for a model."""
+    family = _model_family(model)
+    return _MODEL_CONTEXT_LIMITS.get(family, _MODEL_CONTEXT_LIMITS["default"])
+
+
+def _estimate_msg_chars(msg: dict) -> int:
+    """Estimate character count of a message (for token estimation)."""
+    content = msg.get("content", "")
+    if isinstance(content, str):
+        return len(content)
+    if isinstance(content, list):
+        total = 0
+        for part in content:
+            if part.get("type") == "text":
+                total += len(part.get("text", ""))
+            elif part.get("type") == "image_url":
+                total += 500  # rough estimate for image token overhead
+        return total
+    return 0
+
+
+def _trim_messages_to_fit(messages: list[dict], max_chars: int) -> list[dict]:
+    """
+    Trim messages from the OLD end to fit within max_chars.
+    Always keeps the last message (current user input).
+    Tries to keep conversation pairs intact (user+assistant).
+    """
+    if not messages:
+        return messages
+
+    # Calculate total chars
+    total = sum(_estimate_msg_chars(m) for m in messages)
+    if total <= max_chars:
+        return messages
+
+    # Must trim. Start from the oldest and remove until we fit.
+    # Always keep at least the last 2 messages (latest user + possible assistant before it)
+    min_keep = min(2, len(messages))
+    result = list(messages)
+
+    while len(result) > min_keep:
+        total = sum(_estimate_msg_chars(m) for m in result)
+        if total <= max_chars:
+            break
+        result.pop(0)  # remove oldest message
+
+    return result
+
+
 # ---------- Build Messages ----------
 def build_messages(incoming_messages: list[dict], model: str) -> list[dict]:
     """
@@ -966,9 +1031,25 @@ def build_messages(incoming_messages: list[dict], model: str) -> list[dict]:
 
     # --- 4. Today's conversation from Kelivo ---
     kelivo_start_idx = len(final_messages)
-    for msg in cleaned:
-        if msg["role"] == "system":
-            continue  # we already have our own system prompt
+    kelivo_msgs = [msg for msg in cleaned if msg["role"] != "system"]
+
+    # --- Context window management ---
+    # Estimate tokens for system/memory prefix messages (keep all of them)
+    prefix_chars = sum(_estimate_msg_chars(m) for m in final_messages)
+    max_context = _model_max_context(model)
+    # Reserve tokens: prefix + reply headroom (4096 tokens)
+    reply_reserve = 4096
+    available_chars = int((max_context - reply_reserve) * _CHARS_PER_TOKEN) - prefix_chars
+    if available_chars < 2000:
+        available_chars = 2000  # absolute minimum
+
+    # Trim Kelivo messages from the OLD end, keep recent conversation
+    trimmed_kelivo = _trim_messages_to_fit(kelivo_msgs, available_chars)
+    if len(trimmed_kelivo) < len(kelivo_msgs):
+        logger.info(f"[Context] Trimmed Kelivo messages from {len(kelivo_msgs)} "
+                    f"to {len(trimmed_kelivo)} to fit {max_context} token context")
+
+    for msg in trimmed_kelivo:
         final_messages.append(msg)
 
     # --- OCR fallback + strip image_url for text-only models ---
