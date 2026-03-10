@@ -625,6 +625,98 @@ def _strip_image_content(messages: list[dict]) -> list[dict]:
     return result
 
 
+# ---------- Gateway-side OCR Fallback ----------
+
+# Model used for OCR when target model can't handle images
+_OCR_MODEL = os.environ.get("OCR_MODEL", "qwen-vl-max")
+_OCR_TIMEOUT = 30  # seconds
+
+
+def _call_ocr_model(image_url: str) -> str:
+    """
+    Call Qwen VL to describe/OCR an image.
+    Returns the text description, or empty string on failure.
+    """
+    provider_cfg = get_provider_for_model(_OCR_MODEL)
+    if not provider_cfg:
+        logger.warning(f"[OCR] No provider found for OCR model {_OCR_MODEL}")
+        return ""
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": image_url}},
+                {"type": "text", "text": "请详细描述这张图片的内容。如果图片中有文字，请完整提取所有文字。"},
+            ],
+        }
+    ]
+
+    try:
+        url = f"{provider_cfg['base_url']}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {provider_cfg['api_key']}",
+            "Content-Type": "application/json",
+        }
+        body = {"model": _OCR_MODEL, "messages": messages, "stream": False}
+        resp = _http_session.post(url, headers=headers, json=body, timeout=(10, _OCR_TIMEOUT))
+        resp.raise_for_status()
+        data = resp.json()
+        text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        logger.info(f"[OCR] Got {len(text)} chars from {_OCR_MODEL}")
+        return text.strip()
+    except Exception as e:
+        logger.error(f"[OCR] Failed to call {_OCR_MODEL}: {e}")
+        return ""
+
+
+def _ocr_images_for_text_model(messages: list[dict]) -> list[dict]:
+    """
+    For models that don't support images: find image_url blocks in messages,
+    call Qwen VL to OCR them, and replace image blocks with OCR text.
+    Only processes messages that don't already have <image_file_ocr> tags
+    (i.e., Kelivo didn't already do OCR).
+    """
+    result = []
+    for msg in messages:
+        content = msg.get("content", "")
+        if not isinstance(content, list):
+            result.append(msg)
+            continue
+
+        # Check if this message already has OCR from Kelivo
+        has_ocr = any(
+            "<image_file_ocr>" in p.get("text", "")
+            for p in content
+            if p.get("type") == "text"
+        )
+        if has_ocr:
+            # Kelivo already did OCR, keep as-is (strip_image_content will clean up later)
+            result.append(msg)
+            continue
+
+        # Find image_url parts and do OCR
+        new_parts = []
+        for part in content:
+            if part.get("type") == "image_url":
+                img_url = part.get("image_url", {}).get("url", "")
+                if img_url:
+                    ocr_text = _call_ocr_model(img_url)
+                    if ocr_text:
+                        new_parts.append({
+                            "type": "text",
+                            "text": f"<image_file_ocr>{ocr_text}</image_file_ocr>",
+                        })
+                        continue
+                # Fallback: keep original image part (strip_image_content handles it)
+                new_parts.append(part)
+            else:
+                new_parts.append(part)
+
+        result.append({**msg, "content": new_parts})
+    return result
+
+
 # ---------- Build Messages ----------
 def build_messages(incoming_messages: list[dict], model: str) -> list[dict]:
     """
@@ -774,8 +866,9 @@ def build_messages(incoming_messages: list[dict], model: str) -> list[dict]:
             continue  # we already have our own system prompt
         final_messages.append(msg)
 
-    # --- Strip image_url for text-only models ---
+    # --- OCR fallback + strip image_url for text-only models ---
     if not _model_supports_images(model):
+        final_messages = _ocr_images_for_text_model(final_messages)
         final_messages = _strip_image_content(final_messages)
 
     # --- Final structure log ---
