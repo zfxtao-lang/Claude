@@ -675,32 +675,36 @@ def _call_vision_api(model: str, image_url: str, prompt: str) -> str:
 def _call_ocr_model(image_url: str) -> str:
     """
     Two-stage image understanding:
-    1. Use qwen-vl-ocr to extract text from the image.
-    2. If OCR result is too short (likely a pure photo/meme with no text),
-       fallback to qwen-vl-max to describe the image content.
+    1. Always use qwen-vl-max to describe the image content (primary).
+    2. Use qwen-vl-ocr to extract text as supplementary info.
+    3. Combine both results for a complete understanding.
     """
-    # Stage 1: OCR for text extraction
-    ocr_text = _call_vision_api(
-        _OCR_MODEL, image_url,
-        "请提取这张图片中的所有文字内容。",
-    )
-
-    if len(ocr_text) >= _OCR_MIN_LENGTH:
-        logger.info(f"[OCR] Stage 1 sufficient ({len(ocr_text)} chars), using OCR result")
-        return ocr_text
-
-    # Stage 2: Fallback to vision model for image description
-    logger.info(f"[OCR] Stage 1 too short ({len(ocr_text)} chars), falling back to {_VISION_MODEL}")
+    # Stage 1: Always describe the image with vision model (primary)
+    logger.info(f"[OCR] Stage 1: describing image with {_VISION_MODEL}")
     desc_text = _call_vision_api(
         _VISION_MODEL, image_url,
         "请详细描述这张图片的内容，包括场景、物体、人物、颜色、表情、文字等所有可见信息。",
     )
 
-    if desc_text:
-        return desc_text
+    # Stage 2: OCR for supplementary text extraction
+    ocr_text = _call_vision_api(
+        _OCR_MODEL, image_url,
+        "请提取这张图片中的所有文字内容。",
+    )
 
-    # If both failed but OCR had something, return that
-    return ocr_text
+    # Combine results
+    if desc_text and ocr_text and len(ocr_text) >= _OCR_MIN_LENGTH:
+        logger.info(f"[OCR] Combining vision description ({len(desc_text)} chars) + OCR text ({len(ocr_text)} chars)")
+        return f"[图片描述] {desc_text}\n[图片中的文字] {ocr_text}"
+    elif desc_text:
+        logger.info(f"[OCR] Using vision description only ({len(desc_text)} chars)")
+        return f"[图片描述] {desc_text}"
+    elif ocr_text:
+        logger.info(f"[OCR] Using OCR text only ({len(ocr_text)} chars)")
+        return ocr_text
+    else:
+        logger.warning("[OCR] Both vision and OCR failed")
+        return ""
 
 
 def _ocr_images_for_text_model(messages: list[dict]) -> list[dict]:
