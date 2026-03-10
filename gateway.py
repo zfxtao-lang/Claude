@@ -638,21 +638,38 @@ def _call_vision_api(model: str, image_url: str, prompt: str) -> str:
     """
     Call a vision-capable model with an image and prompt.
     Returns the text response, or empty string on failure.
+
+    Note: qwen-vl-ocr requires a special format — the user prompt must be
+    exactly "Read all the text in the image." and any custom instructions
+    go in the system message.
     """
     provider_cfg = get_provider_for_model(model)
     if not provider_cfg:
         logger.warning(f"[Vision] No provider found for model {model}")
         return ""
 
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "image_url", "image_url": {"url": image_url}},
-                {"type": "text", "text": prompt},
-            ],
-        }
-    ]
+    # qwen-vl-ocr has a rigid API format requirement
+    if "vl-ocr" in model:
+        messages = [
+            {"role": "system", "content": [{"type": "text", "text": prompt}]},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": image_url}},
+                    {"type": "text", "text": "Read all the text in the image."},
+                ],
+            },
+        ]
+    else:
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": image_url}},
+                    {"type": "text", "text": prompt},
+                ],
+            }
+        ]
 
     try:
         url = f"{provider_cfg['base_url']}/chat/completions"
@@ -687,9 +704,10 @@ def _call_ocr_model(image_url: str) -> str:
     )
 
     # Stage 2: OCR for supplementary text extraction
+    # For qwen-vl-ocr this prompt goes into the system message
     ocr_text = _call_vision_api(
         _OCR_MODEL, image_url,
-        "请提取这张图片中的所有文字内容。",
+        "Extract all visible text from the image. Keep the original reading order and layout structure. For document-type content, use markdown and latex format.",
     )
 
     # Combine results
