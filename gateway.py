@@ -728,7 +728,44 @@ def _ocr_images_for_text_model(messages: list[dict]) -> list[dict]:
             if p.get("type") == "text"
         )
         if has_ocr:
-            # Kelivo already did OCR, keep as-is (strip_image_content will clean up later)
+            # Check if Kelivo's OCR includes image description
+            has_desc = any(
+                "[图片描述]" in p.get("text", "")
+                for p in content
+                if p.get("type") == "text"
+            )
+            if not has_desc:
+                # Kelivo only did text OCR, no image description.
+                # Find image_url and call vision model to add description.
+                img_url = next(
+                    (p.get("image_url", {}).get("url", "")
+                     for p in content if p.get("type") == "image_url"),
+                    "",
+                )
+                if img_url:
+                    logger.info("[OCR] Kelivo OCR lacks image description, calling vision model")
+                    desc = _call_vision_api(
+                        _VISION_MODEL, img_url,
+                        "请详细描述这张图片的内容，包括场景、物体、人物、颜色、表情、文字等所有可见信息。",
+                    )
+                    if desc:
+                        # Prepend description to existing OCR tags
+                        enhanced = []
+                        for p in content:
+                            if (p.get("type") == "text"
+                                    and "<image_file_ocr>" in p.get("text", "")):
+                                enhanced.append({
+                                    "type": "text",
+                                    "text": p["text"].replace(
+                                        "<image_file_ocr>",
+                                        f"<image_file_ocr>[图片描述] {desc}\n",
+                                    ),
+                                })
+                            else:
+                                enhanced.append(p)
+                        result.append({**msg, "content": enhanced})
+                        continue
+            # Kelivo OCR is sufficient, keep as-is
             result.append(msg)
             continue
 
