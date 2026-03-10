@@ -59,6 +59,7 @@ from memory_cards import (
     search_memory_cards,
 )
 from notion_cache import get_notion_content, invalidate_cache
+from notion_tools import NOTION_TOOLS, execute_tool_call
 
 # ---------- App Setup ----------
 app = Flask(__name__)
@@ -135,6 +136,32 @@ RECENT_MSG_ROUNDS = int(os.getenv("RECENT_MSG_ROUNDS", "15"))    # today's cross
 VECTOR_MIN_SCORE = float(os.getenv("VECTOR_MIN_SCORE", "0.2"))
 VECTOR_NEIGHBOR_WINDOW = int(os.getenv("VECTOR_NEIGHBOR_WINDOW", "1"))
 VECTOR_EXCLUDE_HOURS = int(os.getenv("VECTOR_EXCLUDE_HOURS", "2"))
+
+# ---------- Function Calling (Notion Tools) ----------
+ENABLE_NOTION_TOOLS = os.getenv("ENABLE_NOTION_TOOLS", "true").lower() in ("true", "1", "yes")
+MAX_TOOL_ROUNDS = int(os.getenv("MAX_TOOL_ROUNDS", "3"))  # max tool call iterations per request
+
+# Models that support function calling (prefix match)
+_TOOL_CAPABLE_PREFIXES = (
+    "anthropic/",    # Claude via OpenRouter
+    "openai/",       # GPT via OpenRouter
+    "google/",       # Gemini via OpenRouter
+    "gpt-4",         # direct
+    "claude",        # direct
+    "deepseek-",     # DeepSeek
+    "glm-4",         # Zhipu GLM-4+
+    "glm-5",         # Zhipu GLM-5
+    "qwen-max",      # Qwen
+    "qwen-plus",     # Qwen
+    "qwen-turbo",    # Qwen
+    "qwen2.5",       # Qwen 2.5
+)
+
+
+def _model_supports_tools(model: str) -> bool:
+    """Check if a model supports function calling / tools."""
+    m = model.lower()
+    return any(m.startswith(p) for p in _TOOL_CAPABLE_PREFIXES)
 
 
 def vector_search_memories(query: str, top_k: int = 5,
@@ -1179,6 +1206,186 @@ def _is_kelivo_summary_request(messages: list[dict]) -> bool:
     return False
 
 
+# ---------- API Call Helpers ----------
+
+def _call_with_retry(provider_cfg, messages, model, stream, extra):
+    """
+    Call provider API with retry logic.
+    Returns (response, None) on success, or (None, error_response) on failure.
+    """
+    last_error = None
+    for attempt in range(API_MAX_RETRIES + 1):
+        try:
+            resp = call_provider(provider_cfg, messages, model, stream, **extra)
+
+            if resp.status_code != 200:
+                error_body = resp.text
+                logger.error(f"API error {resp.status_code} (attempt {attempt + 1}): "
+                             f"{error_body[:300]}")
+                if (resp.status_code >= 500 or resp.status_code == 429) \
+                        and attempt < API_MAX_RETRIES:
+                    retry_after = resp.headers.get("Retry-After")
+                    if retry_after and resp.status_code == 429:
+                        wait = min(float(retry_after), 30)
+                    else:
+                        wait = API_RETRY_BACKOFF * (2 ** attempt)
+                    logger.info(f"Retrying in {wait:.1f}s...")
+                    time.sleep(wait)
+                    continue
+                return None, (jsonify({"error": {"message": error_body,
+                                                  "type": "api_error"}}), resp.status_code)
+            return resp, None
+        except requests.Timeout:
+            logger.error(f"API timeout (attempt {attempt + 1}/{API_MAX_RETRIES + 1})")
+            last_error = "API request timed out"
+            if attempt < API_MAX_RETRIES:
+                time.sleep(API_RETRY_BACKOFF * (2 ** attempt))
+                continue
+            return None, (jsonify({"error": {"message": last_error,
+                                              "type": "timeout_error"}}), 504)
+        except (requests.ConnectionError, requests.RequestException) as e:
+            logger.error(f"API connection error (attempt {attempt + 1}): {e}")
+            last_error = str(e)
+            if attempt < API_MAX_RETRIES:
+                time.sleep(API_RETRY_BACKOFF * (2 ** attempt))
+                continue
+            return None, (jsonify({"error": {"message": last_error,
+                                              "type": "api_error"}}), 502)
+    return None, (jsonify({"error": {"message": "Max retries exceeded",
+                                      "type": "api_error"}}), 502)
+
+
+def _tool_call_loop(provider_cfg, messages, model, extra, max_rounds):
+    """
+    Non-streaming tool call loop.
+    Calls the provider, checks for tool_calls, executes them, and loops.
+    Returns (result_json, None) on success, or (None, error_response) on failure.
+    """
+    loop_messages = list(messages)
+    loop_extra = dict(extra)
+
+    for round_idx in range(max_rounds + 1):
+        # Always non-streaming for tool call rounds
+        resp, error_resp = _call_with_retry(provider_cfg, loop_messages, model,
+                                            stream=False, extra=loop_extra)
+        if error_resp:
+            return None, error_resp
+
+        resp.encoding = "utf-8"
+        result = resp.json()
+        choices = result.get("choices", [])
+        if not choices:
+            logger.warning(f"[Tools] round {round_idx}: no choices in response")
+            return result, None
+
+        message = choices[0].get("message", {})
+        finish_reason = choices[0].get("finish_reason", "")
+        tool_calls = message.get("tool_calls", [])
+
+        # No tool calls or finish_reason is "stop" → final response
+        if not tool_calls or finish_reason == "stop":
+            logger.info(f"[Tools] round {round_idx}: final response "
+                        f"(finish_reason={finish_reason})")
+            # Strip tool_calls from the final response to not confuse the client
+            if "tool_calls" in message:
+                del message["tool_calls"]
+            return result, None
+
+        # Guard: don't exceed max rounds
+        if round_idx >= max_rounds:
+            logger.warning(f"[Tools] max rounds ({max_rounds}) reached, "
+                           f"returning last response")
+            # Force a final call without tools
+            no_tools_extra = {k: v for k, v in loop_extra.items()
+                              if k not in ("tools", "tool_choice")}
+            resp2, err2 = _call_with_retry(provider_cfg, loop_messages, model,
+                                           stream=False, extra=no_tools_extra)
+            if err2:
+                return None, err2
+            resp2.encoding = "utf-8"
+            return resp2.json(), None
+
+        # Execute each tool call
+        logger.info(f"[Tools] round {round_idx}: model called "
+                    f"{len(tool_calls)} tool(s): "
+                    f"{[tc.get('function', {}).get('name', '?') for tc in tool_calls]}")
+
+        # Add the assistant message (with tool_calls) to conversation
+        loop_messages.append(message)
+
+        for tc in tool_calls:
+            tc_id = tc.get("id", "")
+            func = tc.get("function", {})
+            tool_name = func.get("name", "")
+            try:
+                arguments = json.loads(func.get("arguments", "{}"))
+            except json.JSONDecodeError:
+                arguments = {}
+
+            logger.info(f"[Tools] executing {tool_name}({json.dumps(arguments, ensure_ascii=False)[:200]})")
+            tool_result = execute_tool_call(tool_name, arguments)
+            logger.info(f"[Tools] {tool_name} result: {tool_result[:300]}")
+
+            # Add tool result message
+            loop_messages.append({
+                "role": "tool",
+                "tool_call_id": tc_id,
+                "content": tool_result,
+            })
+
+    # Should not reach here, but just in case
+    return result, None
+
+
+def _fake_stream_response(result_json):
+    """
+    Convert a non-streaming JSON response into SSE stream format.
+    Used when tool call loop produced a non-streaming result but client
+    requested streaming.
+    """
+    def generate():
+        choices = result_json.get("choices", [])
+        content = ""
+        if choices:
+            content = choices[0].get("message", {}).get("content", "")
+
+        if content:
+            # Send the full content as a single chunk (model already generated it)
+            chunk = {
+                "id": result_json.get("id", f"chatcmpl-{uuid.uuid4().hex[:8]}"),
+                "object": "chat.completion.chunk",
+                "created": result_json.get("created", int(time.time())),
+                "model": result_json.get("model", ""),
+                "choices": [{
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": content},
+                    "finish_reason": None,
+                }],
+            }
+            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+        # Send finish chunk
+        finish_chunk = {
+            "id": result_json.get("id", f"chatcmpl-{uuid.uuid4().hex[:8]}"),
+            "object": "chat.completion.chunk",
+            "created": result_json.get("created", int(time.time())),
+            "model": result_json.get("model", ""),
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": "stop",
+            }],
+        }
+        yield f"data: {json.dumps(finish_chunk, ensure_ascii=False)}\n\n"
+        yield "data: [DONE]\n\n"
+
+    return Response(
+        stream_with_context(generate()),
+        content_type="text/event-stream; charset=utf-8",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 # ---------- Main Chat Endpoint ----------
 @app.route("/v1/chat/completions", methods=["POST", "OPTIONS"])
 @require_auth
@@ -1271,47 +1478,47 @@ def chat_completions():
         if key in data:
             extra[key] = data[key]
 
-    # Call API with retry (retries on 5xx, 429, timeout, connection errors)
-    last_error = None
-    for attempt in range(API_MAX_RETRIES + 1):
-        try:
-            resp = call_provider(provider_cfg, messages, model, stream, **extra)
+    # ---------- Inject Notion tools if model supports them ----------
+    use_tools = (ENABLE_NOTION_TOOLS
+                 and _model_supports_tools(model)
+                 and "tools" not in extra)  # don't override client-provided tools
+    if use_tools:
+        extra["tools"] = NOTION_TOOLS
+        extra["tool_choice"] = "auto"
+        logger.info(f"[Tools] injected {len(NOTION_TOOLS)} Notion tools for {model}")
 
-            if resp.status_code != 200:
-                error_body = resp.text
-                logger.error(f"API error {resp.status_code} (attempt {attempt + 1}): "
-                             f"{error_body[:300]}")
-                # Retry on server errors (5xx) and rate limiting (429)
-                if (resp.status_code >= 500 or resp.status_code == 429) \
-                        and attempt < API_MAX_RETRIES:
-                    # Respect Retry-After header from provider if present
-                    retry_after = resp.headers.get("Retry-After")
-                    if retry_after and resp.status_code == 429:
-                        wait = min(float(retry_after), 30)
-                    else:
-                        wait = API_RETRY_BACKOFF * (2 ** attempt)
-                    logger.info(f"Retrying in {wait:.1f}s...")
-                    time.sleep(wait)
-                    continue
-                return jsonify({"error": {"message": error_body,
-                                          "type": "api_error"}}), resp.status_code
-            break
-        except requests.Timeout:
-            logger.error(f"API timeout (attempt {attempt + 1}/{API_MAX_RETRIES + 1})")
-            last_error = "API request timed out"
-            if attempt < API_MAX_RETRIES:
-                time.sleep(API_RETRY_BACKOFF * (2 ** attempt))
-                continue
-            return jsonify({"error": {"message": last_error,
-                                      "type": "timeout_error"}}), 504
-        except (requests.ConnectionError, requests.RequestException) as e:
-            logger.error(f"API connection error (attempt {attempt + 1}): {e}")
-            last_error = str(e)
-            if attempt < API_MAX_RETRIES:
-                time.sleep(API_RETRY_BACKOFF * (2 ** attempt))
-                continue
-            return jsonify({"error": {"message": last_error,
-                                      "type": "api_error"}}), 502
+    # ---------- Tool call loop (non-streaming internally) ----------
+    if use_tools:
+        result_json, error_resp = _tool_call_loop(
+            provider_cfg, messages, model, extra, MAX_TOOL_ROUNDS)
+        if error_resp:
+            return error_resp
+
+        # Extract and save assistant reply
+        assistant_content = ""
+        choices = result_json.get("choices", [])
+        if choices:
+            assistant_content = choices[0].get("message", {}).get("content", "")
+
+        if assistant_content:
+            tokens_in = result_json.get("usage", {}).get("prompt_tokens", 0)
+            tokens_out = result_json.get("usage", {}).get("completion_tokens", 0)
+            save_message(conversation_id, "assistant", assistant_content,
+                         model, provider_name, tokens_in, tokens_out)
+        else:
+            logger.warning(f"Empty assistant response after tool loop. "
+                           f"Raw: {json.dumps(result_json)[:500]}")
+
+        # Deliver response: fake-stream if client wanted streaming
+        if stream:
+            return _fake_stream_response(result_json)
+        return jsonify(result_json)
+
+    # ---------- Normal flow (no tools) ----------
+    # Call API with retry
+    resp, error_resp = _call_with_retry(provider_cfg, messages, model, stream, extra)
+    if error_resp:
+        return error_resp
 
     # ---------- Streaming response ----------
     if stream:
