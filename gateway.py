@@ -628,7 +628,7 @@ def _strip_image_content(messages: list[dict]) -> list[dict]:
 # ---------- Gateway-side OCR Fallback ----------
 
 # Model used for OCR when target model can't handle images
-_OCR_MODEL = os.environ.get("OCR_MODEL", "qwen-vl-max")
+_OCR_MODEL = os.environ.get("OCR_MODEL", "qwen-vl-ocr")
 _OCR_TIMEOUT = 30  # seconds
 
 
@@ -647,7 +647,7 @@ def _call_ocr_model(image_url: str) -> str:
             "role": "user",
             "content": [
                 {"type": "image_url", "image_url": {"url": image_url}},
-                {"type": "text", "text": "请详细描述这张图片的内容。如果图片中有文字，请完整提取所有文字。"},
+                {"type": "text", "text": "请提取并描述这张图片的所有内容，包括文字、图表、表情等。"},
             ],
         }
     ]
