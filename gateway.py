@@ -788,7 +788,7 @@ def _strip_image_content(messages: list[dict]) -> list[dict]:
 # Model used for OCR when target model can't handle images
 _OCR_MODEL = os.environ.get("OCR_MODEL", "qwen-vl-ocr")
 _VISION_MODEL = os.environ.get("VISION_MODEL", "qwen-vl-max")
-_OCR_TIMEOUT = 30  # seconds
+_OCR_TIMEOUT = 5  # seconds — fail fast, skip OCR on timeout
 _OCR_MIN_LENGTH = 10  # below this, treat as "no text found" and fallback to vision
 _OCR_MAX_CHARS = 3000  # max chars for OCR text to avoid blowing up context
 
@@ -841,7 +841,7 @@ def _call_vision_api(model: str, image_url: str, prompt: str) -> str:
             "Content-Type": "application/json",
         }
         body = {"model": model, "messages": messages, "stream": False}
-        resp = _http_session.post(url, headers=headers, json=body, timeout=(10, _OCR_TIMEOUT))
+        resp = _http_session.post(url, headers=headers, json=body, timeout=(3, _OCR_TIMEOUT))
         resp.raise_for_status()
         data = resp.json()
         text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
@@ -898,85 +898,102 @@ def _call_ocr_model(image_url: str) -> str:
 
 def _ocr_images_for_text_model(messages: list[dict]) -> list[dict]:
     """
-    For models that don't support images: find image_url blocks in messages,
-    call Qwen VL to OCR them, and replace image blocks with OCR text.
-    Only processes messages that don't already have <image_file_ocr> tags
-    (i.e., Kelivo didn't already do OCR).
-    """
-    result = []
-    for msg in messages:
-        content = msg.get("content", "")
-        if not isinstance(content, list):
-            result.append(msg)
-            continue
+    For models that don't support images: OCR image_url blocks and replace
+    them with text descriptions.
 
-        # Check if this message already has OCR from Kelivo
-        has_ocr = any(
-            "<image_file_ocr>" in p.get("text", "")
+    Performance: Only processes the LAST user message. Historical messages
+    with images are left for _strip_image_content to handle (removes them).
+    This avoids wasting time OCR-ing images from old turns.
+    """
+    if not messages:
+        return messages
+
+    # Find the last user message index
+    last_user_idx = None
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].get("role") == "user":
+            last_user_idx = i
+            break
+
+    if last_user_idx is None:
+        return messages
+
+    last_msg = messages[last_user_idx]
+    content = last_msg.get("content", "")
+    if not isinstance(content, list):
+        return messages
+
+    # Check if the last user message actually has image_url blocks
+    has_images = any(p.get("type") == "image_url" for p in content)
+    if not has_images:
+        logger.info("[OCR] Last user message has no images, skipping OCR entirely")
+        return messages
+
+    # Check if this message already has OCR from Kelivo
+    has_ocr = any(
+        "<image_file_ocr>" in p.get("text", "")
+        for p in content
+        if p.get("type") == "text"
+    )
+    if has_ocr:
+        # Check if Kelivo's OCR includes image description
+        has_desc = any(
+            "[图片描述]" in p.get("text", "")
             for p in content
             if p.get("type") == "text"
         )
-        if has_ocr:
-            # Check if Kelivo's OCR includes image description
-            has_desc = any(
-                "[图片描述]" in p.get("text", "")
-                for p in content
-                if p.get("type") == "text"
+        if not has_desc:
+            img_url = next(
+                (p.get("image_url", {}).get("url", "")
+                 for p in content if p.get("type") == "image_url"),
+                "",
             )
-            if not has_desc:
-                # Kelivo only did text OCR, no image description.
-                # Find image_url and call vision model to add description.
-                img_url = next(
-                    (p.get("image_url", {}).get("url", "")
-                     for p in content if p.get("type") == "image_url"),
-                    "",
+            if img_url:
+                logger.info("[OCR] Kelivo OCR lacks image description, calling vision model")
+                desc = _call_vision_api(
+                    _VISION_MODEL, img_url,
+                    "请详细描述这张图片的内容，包括场景、物体、人物、颜色、表情、文字等所有可见信息。",
                 )
-                if img_url:
-                    logger.info("[OCR] Kelivo OCR lacks image description, calling vision model")
-                    desc = _call_vision_api(
-                        _VISION_MODEL, img_url,
-                        "请详细描述这张图片的内容，包括场景、物体、人物、颜色、表情、文字等所有可见信息。",
-                    )
-                    if desc:
-                        # Prepend description to existing OCR tags
-                        enhanced = []
-                        for p in content:
-                            if (p.get("type") == "text"
-                                    and "<image_file_ocr>" in p.get("text", "")):
-                                enhanced.append({
-                                    "type": "text",
-                                    "text": p["text"].replace(
-                                        "<image_file_ocr>",
-                                        f"<image_file_ocr>[图片描述] {desc}\n",
-                                    ),
-                                })
-                            else:
-                                enhanced.append(p)
-                        result.append({**msg, "content": enhanced})
-                        continue
-            # Kelivo OCR is sufficient, keep as-is
-            result.append(msg)
-            continue
+                if desc:
+                    enhanced = []
+                    for p in content:
+                        if (p.get("type") == "text"
+                                and "<image_file_ocr>" in p.get("text", "")):
+                            enhanced.append({
+                                "type": "text",
+                                "text": p["text"].replace(
+                                    "<image_file_ocr>",
+                                    f"<image_file_ocr>[图片描述] {desc}\n",
+                                ),
+                            })
+                        else:
+                            enhanced.append(p)
+                    result = list(messages)
+                    result[last_user_idx] = {**last_msg, "content": enhanced}
+                    return result
+        # Kelivo OCR is sufficient
+        return messages
 
-        # Find image_url parts and do OCR
-        new_parts = []
-        for part in content:
-            if part.get("type") == "image_url":
-                img_url = part.get("image_url", {}).get("url", "")
-                if img_url:
-                    ocr_text = _call_ocr_model(img_url)
-                    if ocr_text:
-                        new_parts.append({
-                            "type": "text",
-                            "text": f"<image_file_ocr>{ocr_text}</image_file_ocr>",
-                        })
-                        continue
-                # Fallback: keep original image part (strip_image_content handles it)
-                new_parts.append(part)
-            else:
-                new_parts.append(part)
+    # Do OCR on image_url parts in the last user message only
+    new_parts = []
+    for part in content:
+        if part.get("type") == "image_url":
+            img_url = part.get("image_url", {}).get("url", "")
+            if img_url:
+                ocr_text = _call_ocr_model(img_url)
+                if ocr_text:
+                    new_parts.append({
+                        "type": "text",
+                        "text": f"<image_file_ocr>{ocr_text}</image_file_ocr>",
+                    })
+                    continue
+            # Fallback: keep original image part (strip_image_content handles it)
+            new_parts.append(part)
+        else:
+            new_parts.append(part)
 
-        result.append({**msg, "content": new_parts})
+    result = list(messages)
+    result[last_user_idx] = {**last_msg, "content": new_parts}
     return result
 
 
