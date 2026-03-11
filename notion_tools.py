@@ -221,6 +221,85 @@ def exec_notion_append(page_id: str, content: str) -> str:
         return json.dumps({"error": f"Failed to append: {str(e)}"})
 
 
+def exec_notion_query_database(database_id: str, filter_json: str = "",
+                                sort_field: str = "", limit: int = 10) -> str:
+    """Query a Notion database and return its entries."""
+    if not NOTION_TOKEN:
+        return json.dumps({"error": "Notion token not configured"})
+
+    headers = _notion_headers()
+    body: dict = {"page_size": min(limit, 100)}
+
+    if filter_json:
+        try:
+            body["filter"] = json.loads(filter_json)
+        except json.JSONDecodeError:
+            return json.dumps({"error": "Invalid filter JSON"})
+
+    if sort_field:
+        body["sorts"] = [{"property": sort_field,
+                          "direction": "descending"}]
+
+    try:
+        logger.info(f"[NotionAPI] query_database: db_id={database_id}, limit={limit}")
+        resp = requests.post(
+            f"{_NOTION_API}/databases/{database_id}/query",
+            headers=headers, json=body, timeout=15)
+        logger.info(f"[NotionAPI] query_database response: {resp.status_code}")
+        if resp.status_code != 200:
+            error_body = resp.text[:500]
+            logger.error(f"[NotionAPI] query_database error: {error_body}")
+            return json.dumps({"error": f"Notion API {resp.status_code}: {error_body}"})
+
+        results = resp.json().get("results", [])
+        entries = []
+        for r in results:
+            entry = {
+                "id": r.get("id", ""),
+                "created_time": r.get("created_time", ""),
+                "last_edited_time": r.get("last_edited_time", ""),
+                "url": r.get("url", ""),
+                "properties": {},
+            }
+            for prop_name, prop_val in r.get("properties", {}).items():
+                ptype = prop_val.get("type", "")
+                if ptype == "title":
+                    entry["properties"][prop_name] = _rich_text_to_plain(
+                        prop_val.get("title", []))
+                elif ptype == "rich_text":
+                    entry["properties"][prop_name] = _rich_text_to_plain(
+                        prop_val.get("rich_text", []))
+                elif ptype == "number":
+                    entry["properties"][prop_name] = prop_val.get("number")
+                elif ptype == "select":
+                    sel = prop_val.get("select")
+                    entry["properties"][prop_name] = sel.get("name", "") if sel else ""
+                elif ptype == "multi_select":
+                    entry["properties"][prop_name] = [
+                        s.get("name", "") for s in prop_val.get("multi_select", [])]
+                elif ptype == "date":
+                    d = prop_val.get("date")
+                    entry["properties"][prop_name] = d.get("start", "") if d else ""
+                elif ptype == "checkbox":
+                    entry["properties"][prop_name] = prop_val.get("checkbox", False)
+                elif ptype == "status":
+                    st = prop_val.get("status")
+                    entry["properties"][prop_name] = st.get("name", "") if st else ""
+                else:
+                    entry["properties"][prop_name] = f"<{ptype}>"
+            entries.append(entry)
+
+        return json.dumps({
+            "database_id": database_id,
+            "count": len(entries),
+            "entries": entries,
+        }, ensure_ascii=False)
+
+    except Exception as e:
+        logger.error(f"[NotionAPI] query_database exception: {e}", exc_info=True)
+        return json.dumps({"error": f"Failed to query database: {str(e)}"})
+
+
 def exec_notion_create_page(parent_page_id: str, title: str,
                             content: str = "") -> str:
     """Create a new sub-page under a parent page."""
@@ -318,6 +397,38 @@ NOTION_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "notion_query_database",
+            "description": "查询Notion数据库中的条目。用于读取数据库（如日记本、任务列表等）里的记录。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "database_id": {
+                        "type": "string",
+                        "description": "Notion数据库ID（32位hex字符串）",
+                    },
+                    "filter_json": {
+                        "type": "string",
+                        "description": "Notion filter对象的JSON字符串（可选，用于筛选条目）",
+                        "default": "",
+                    },
+                    "sort_field": {
+                        "type": "string",
+                        "description": "按哪个属性排序（可选，默认按创建时间）",
+                        "default": "",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "最多返回几条记录（默认10，最大100）",
+                        "default": 10,
+                    },
+                },
+                "required": ["database_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "notion_create_page",
             "description": "在指定父页面下创建新的Notion子页面。用于创建新笔记或新主题。",
             "parameters": {
@@ -351,6 +462,9 @@ _TOOL_DISPATCH = {
     "notion_read_page": lambda args: exec_notion_read_page(args["page_id"]),
     "notion_search": lambda args: exec_notion_search(args["query"]),
     "notion_append": lambda args: exec_notion_append(args["page_id"], args["content"]),
+    "notion_query_database": lambda args: exec_notion_query_database(
+        args["database_id"], args.get("filter_json", ""),
+        args.get("sort_field", ""), args.get("limit", 10)),
     "notion_create_page": lambda args: exec_notion_create_page(
         args["parent_page_id"], args["title"], args.get("content", "")),
 }

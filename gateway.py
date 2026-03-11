@@ -1669,7 +1669,7 @@ def test_notion_tools():
     # Use top-level imports (already imported at module level)
     from notion_tools import (
         exec_notion_search, exec_notion_read_page,
-        exec_notion_append, NOTION_TOOLS,
+        exec_notion_append, exec_notion_query_database, NOTION_TOOLS,
     )
 
     result = {"action": action}
@@ -1714,6 +1714,15 @@ def test_notion_tools():
     elif action == "append":
         params = data.get("params", {})
         raw = exec_notion_append(params.get("page_id", ""), params.get("content", ""))
+        result["raw_result"] = json.loads(raw)
+
+    elif action == "query_database":
+        params = data.get("params", {})
+        raw = exec_notion_query_database(
+            params.get("database_id", ""),
+            params.get("filter_json", ""),
+            params.get("sort_field", ""),
+            params.get("limit", 10))
         result["raw_result"] = json.loads(raw)
 
     else:
