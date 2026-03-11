@@ -89,16 +89,6 @@ _http_session.mount("http://", _adapter)
 init_db()
 start_writer()  # Start async DB write thread
 
-# ---------- Startup: confirm Notion tools status ----------
-logger.info(f"[Startup] ENABLE_NOTION_TOOLS={ENABLE_NOTION_TOOLS}, "
-            f"MAX_TOOL_ROUNDS={MAX_TOOL_ROUNDS}, "
-            f"notion_tools imported={'NOTION_TOOLS' in dir()}")
-try:
-    from notion_tools import NOTION_TOOLS as _nt_check
-    logger.info(f"[Startup] Notion tools loaded: {[t['function']['name'] for t in _nt_check]}")
-except Exception as e:
-    logger.error(f"[Startup] Failed to import notion_tools: {e}")
-
 
 # ---------- Background Embedding Worker ----------
 # REMOVED: realtime embedding worker that caused vector pollution.
@@ -179,6 +169,12 @@ def _model_supports_tools(model: str) -> bool:
     """Check if a model supports function calling / tools."""
     m = model.lower()
     return any(m.startswith(p) for p in _TOOL_CAPABLE_PREFIXES)
+
+
+# ---------- Startup: confirm Notion tools status ----------
+logger.info(f"[Startup] ENABLE_NOTION_TOOLS={ENABLE_NOTION_TOOLS}, "
+            f"MAX_TOOL_ROUNDS={MAX_TOOL_ROUNDS}, "
+            f"NOTION_TOOLS loaded={len(NOTION_TOOLS)} tools")
 
 
 def vector_search_memories(query: str, top_k: int = 5,
