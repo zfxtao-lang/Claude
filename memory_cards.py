@@ -282,15 +282,18 @@ def embed_pending_cards() -> int:
 
 
 def search_memory_cards(query: str, top_k: int = 5,
-                        min_score: float = 0.25) -> list[dict]:
+                        min_score: float = 0.25,
+                        query_vec=None) -> list[dict]:
     """
     Search memory cards by vector similarity.
     Returns cards with scores, sorted by relevance.
+    If query_vec is provided, skip embedding API call (dedup optimization).
     """
     if card_vector_store.size == 0:
         return []
 
-    query_vec = get_embedding(query)
+    if query_vec is None:
+        query_vec = get_embedding(query)
     if query_vec is None:
         return []
 

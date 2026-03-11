@@ -178,7 +178,8 @@ logger.info(f"[Startup] ENABLE_NOTION_TOOLS={ENABLE_NOTION_TOOLS}, "
 
 
 def vector_search_memories(query: str, top_k: int = 5,
-                           min_score: float = None) -> list[dict]:
+                           min_score: float = None,
+                           query_vec=None) -> list[dict]:
     """
     Search memories using vector similarity + context expansion + time filter.
 
@@ -187,6 +188,8 @@ def vector_search_memories(query: str, top_k: int = 5,
     3. Filter out chunks from the last VECTOR_EXCLUDE_HOURS
     4. Expand with neighboring chunks from same conversation
     5. Return grouped by conversation in time order
+
+    If query_vec is provided, skip embedding API call (dedup optimization).
     """
     if min_score is None:
         min_score = VECTOR_MIN_SCORE
@@ -195,7 +198,8 @@ def vector_search_memories(query: str, top_k: int = 5,
         logger.info("[Vector] store empty, skipping vector search")
         return []
 
-    query_vec = get_embedding(query)
+    if query_vec is None:
+        query_vec = get_embedding(query)
     if query_vec is None:
         logger.warning("[Vector] failed to embed query, skipping vector search")
         return []
@@ -1045,11 +1049,42 @@ def build_messages(incoming_messages: list[dict], model: str) -> list[dict]:
     - Memories placed BEFORE today's chat so model reads them first
     - Excludes recent 24h from search to avoid self-pollution
     """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     system_prompt = load_system_prompt()
-    notion_content = get_notion_content()
 
     # Filter out Kelivo junk
     cleaned = filter_kelivo_messages(incoming_messages)
+    raw_user_msg = extract_latest_user_message(cleaned)
+
+    # --- Parallel fetch: Notion, recent context, embedding (all independent) ---
+    notion_content = None
+    recent_ctx = None
+    query_vec = None
+
+    def _fetch_notion():
+        return get_notion_content()
+
+    def _fetch_recent_ctx():
+        return build_recent_context(model)
+
+    def _fetch_embedding():
+        if raw_user_msg:
+            return get_embedding(raw_user_msg)
+        return None
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        fut_notion = pool.submit(_fetch_notion)
+        fut_recent = pool.submit(_fetch_recent_ctx)
+        fut_embed = pool.submit(_fetch_embedding)
+
+        notion_content = fut_notion.result()
+        recent_ctx = fut_recent.result()
+        query_vec = fut_embed.result()
+
+    logger.info(f"[Perf] parallel fetch done: notion={'yes' if notion_content else 'no'}, "
+                f"recent_ctx={'yes' if recent_ctx else 'no'}, "
+                f"embedding={'yes' if query_vec is not None else 'no'}")
 
     # Message structure (top-down, model reads in this order):
     #   1. system(persona + model-specific patch) — highest weight
@@ -1080,7 +1115,6 @@ def build_messages(incoming_messages: list[dict], model: str) -> list[dict]:
         })
 
     # --- 2.5. Recent context (cross-window awareness, unconditional) ---
-    recent_ctx = build_recent_context(model)
     if recent_ctx:
         final_messages.append({
             "role": "system",
@@ -1092,13 +1126,23 @@ def build_messages(incoming_messages: list[dict], model: str) -> list[dict]:
     # Vector search: uses RAW user message (semantic understanding, no jieba needed)
     # LIKE fallback: uses jieba-extracted keywords (catches what vectors miss)
     memory_inject_idx = len(final_messages)
-    raw_user_msg = extract_latest_user_message(cleaned)
     memory_lines = []
 
     if raw_user_msg:
-        # --- Layer 1: Memory cards (short, high-density, fast) ---
+        # --- Layer 1 & 2: Card search + Vector search in parallel (reuse embedding) ---
         logger.info(f"[Memory] query (raw): '{raw_user_msg[:80]}'")
-        card_results = search_memory_cards(raw_user_msg, top_k=3)
+
+        card_results = []
+        vector_chunks = []
+
+        if query_vec is not None:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                fut_cards = pool.submit(search_memory_cards, raw_user_msg, 3, 0.25, query_vec)
+                fut_vectors = pool.submit(vector_search_memories, raw_user_msg,
+                                          HISTORY_SEARCH_LIMIT, None, query_vec)
+                card_results = fut_cards.result() or []
+                vector_chunks = fut_vectors.result() or []
+
         if card_results:
             for card in card_results:
                 date = card.get("date", "?")
@@ -1111,10 +1155,11 @@ def build_messages(incoming_messages: list[dict], model: str) -> list[dict]:
                 memory_lines.append(f"[{date} {ago_str}记忆卡片 相关度:{score:.0%}{tag_str}]\n{summary}")
             logger.info(f"[Memory] card search: {len(card_results)} cards matched")
 
-        # --- Layer 2: Vector chunks (raw conversations, for what cards missed) ---
+        # --- Layer 2: Process vector chunks (already fetched in parallel) ---
         remaining_slots = HISTORY_SEARCH_LIMIT - len(memory_lines)
-        if remaining_slots > 0:
-            vector_chunks = vector_search_memories(raw_user_msg, top_k=remaining_slots)
+        if remaining_slots > 0 and vector_chunks:
+            # Trim to remaining slots
+            vector_chunks = vector_chunks[:remaining_slots * 3]  # keep headroom for grouping
             if vector_chunks:
                 from collections import OrderedDict
                 conv_groups: dict[str, list[dict]] = OrderedDict()
