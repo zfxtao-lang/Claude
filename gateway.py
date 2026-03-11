@@ -1293,19 +1293,26 @@ def _tool_call_loop(provider_cfg, messages, model, extra, max_rounds):
         result = resp.json()
         choices = result.get("choices", [])
         if not choices:
-            logger.warning(f"[Tools] round {round_idx}: no choices in response")
+            logger.warning(f"[Tools] round {round_idx}: no choices in response. "
+                           f"Full response: {json.dumps(result)[:500]}")
             return result, None
 
         message = choices[0].get("message", {})
         finish_reason = choices[0].get("finish_reason", "")
         tool_calls = message.get("tool_calls", [])
+        content = message.get("content")
+
+        logger.info(f"[Tools] round {round_idx}: finish_reason={finish_reason}, "
+                    f"tool_calls={len(tool_calls)}, "
+                    f"content={'None' if content is None else f'{len(str(content))}chars'}")
 
         # No tool calls → final response
         # NOTE: do NOT check finish_reason here. Some providers return
         # finish_reason="stop" even with tool_calls present.
         if not tool_calls:
-            logger.info(f"[Tools] round {round_idx}: final response "
-                        f"(finish_reason={finish_reason})")
+            logger.info(f"[Tools] round {round_idx}: final text response "
+                        f"(finish_reason={finish_reason}, "
+                        f"content_preview={str(content)[:100]})")
             # Strip any leftover tool_calls from the final response
             if "tool_calls" in message:
                 del message["tool_calls"]
@@ -1499,9 +1506,12 @@ def chat_completions():
             extra[key] = data[key]
 
     # ---------- Inject Notion tools if model supports them ----------
-    use_tools = (ENABLE_NOTION_TOOLS
-                 and _model_supports_tools(model)
-                 and "tools" not in extra)  # don't override client-provided tools
+    tools_supported = _model_supports_tools(model)
+    client_has_tools = "tools" in extra
+    use_tools = (ENABLE_NOTION_TOOLS and tools_supported and not client_has_tools)
+    logger.info(f"[Tools] decision: ENABLE={ENABLE_NOTION_TOOLS}, "
+                f"model_supports={tools_supported}(model={model}), "
+                f"client_has_tools={client_has_tools} → use_tools={use_tools}")
     if use_tools:
         extra["tools"] = NOTION_TOOLS
         extra["tool_choice"] = "auto"
@@ -1662,7 +1672,7 @@ def test_notion_tools():
 
     if action == "status":
         # Basic connectivity check
-        token = NOTION_TOKEN if NOTION_TOKEN else config.NOTION_TOKEN
+        token = config.NOTION_TOKEN
         result["notion_token_set"] = bool(token)
         result["notion_token_prefix"] = token[:8] + "..." if token else "(empty)"
         result["notion_page_ids"] = config.NOTION_PAGE_IDS
