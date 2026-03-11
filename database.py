@@ -107,6 +107,9 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_messages_conv
             ON messages(conversation_id, created_at);
 
+        CREATE INDEX IF NOT EXISTS idx_messages_created_at
+            ON messages(created_at);
+
         CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
             conversation_id,
             content,
@@ -918,7 +921,7 @@ def get_recent_cross_window_messages(limit: int = 30) -> list[dict]:
         rows = conn.execute(
             """SELECT role, content, created_at, conversation_id
                FROM messages
-               WHERE date(created_at) = ?
+               WHERE created_at >= ?
                  AND content IS NOT NULL AND content != ''
                ORDER BY id DESC LIMIT ?""",
             (today, limit)

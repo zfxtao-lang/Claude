@@ -1050,8 +1050,9 @@ def build_messages(incoming_messages: list[dict], model: str) -> list[dict]:
     - Memories placed BEFORE today's chat so model reads them first
     - Excludes recent 24h from search to avoid self-pollution
     """
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FutTimeout
 
+    _t_build_start = time.time()
     system_prompt = load_system_prompt()
 
     # Filter out Kelivo junk
@@ -1062,16 +1063,26 @@ def build_messages(incoming_messages: list[dict], model: str) -> list[dict]:
     notion_content = None
     recent_ctx = None
     query_vec = None
+    _t_parallel = time.time()
 
     def _fetch_notion():
-        return get_notion_content()
+        _t = time.time()
+        r = get_notion_content()
+        logger.info(f"[Perf]   notion: {time.time()-_t:.2f}s")
+        return r
 
     def _fetch_recent_ctx():
-        return build_recent_context(model)
+        _t = time.time()
+        r = build_recent_context(model)
+        logger.info(f"[Perf]   recent_ctx: {time.time()-_t:.2f}s")
+        return r
 
     def _fetch_embedding():
         if raw_user_msg:
-            return get_embedding_for_query(raw_user_msg)
+            _t = time.time()
+            r = get_embedding_for_query(raw_user_msg)
+            logger.info(f"[Perf]   embedding: {time.time()-_t:.2f}s")
+            return r
         return None
 
     with ThreadPoolExecutor(max_workers=3) as pool:
@@ -1079,13 +1090,23 @@ def build_messages(incoming_messages: list[dict], model: str) -> list[dict]:
         fut_recent = pool.submit(_fetch_recent_ctx)
         fut_embed = pool.submit(_fetch_embedding)
 
-        notion_content = fut_notion.result()
-        recent_ctx = fut_recent.result()
-        query_vec = fut_embed.result()
+        try:
+            notion_content = fut_notion.result(timeout=5)
+        except (FutTimeout, Exception) as e:
+            logger.warning(f"[Perf] notion fetch timed out or failed: {e}")
+        try:
+            recent_ctx = fut_recent.result(timeout=3)
+        except (FutTimeout, Exception) as e:
+            logger.warning(f"[Perf] recent_ctx fetch timed out or failed: {e}")
+        try:
+            query_vec = fut_embed.result(timeout=4)
+        except (FutTimeout, Exception) as e:
+            logger.warning(f"[Perf] embedding fetch timed out or failed: {e}")
 
-    logger.info(f"[Perf] parallel fetch done: notion={'yes' if notion_content else 'no'}, "
+    logger.info(f"[Perf] parallel fetch total: {time.time()-_t_parallel:.2f}s "
+                f"(notion={'yes' if notion_content else 'no'}, "
                 f"recent_ctx={'yes' if recent_ctx else 'no'}, "
-                f"embedding={'yes' if query_vec is not None else 'no'}")
+                f"embedding={'yes' if query_vec is not None else 'no'})")
 
     # Message structure (top-down, model reads in this order):
     #   1. system(persona + model-specific patch) — highest weight
@@ -1132,6 +1153,7 @@ def build_messages(incoming_messages: list[dict], model: str) -> list[dict]:
     if raw_user_msg:
         # --- Layer 1 & 2: Card search + Vector search in parallel (reuse embedding) ---
         logger.info(f"[Memory] query (raw): '{raw_user_msg[:80]}'")
+        _t_rag = time.time()
 
         card_results = []
         vector_chunks = []
@@ -1141,8 +1163,15 @@ def build_messages(incoming_messages: list[dict], model: str) -> list[dict]:
                 fut_cards = pool.submit(search_memory_cards, raw_user_msg, 3, 0.25, query_vec)
                 fut_vectors = pool.submit(vector_search_memories, raw_user_msg,
                                           HISTORY_SEARCH_LIMIT, None, query_vec)
-                card_results = fut_cards.result() or []
-                vector_chunks = fut_vectors.result() or []
+                try:
+                    card_results = fut_cards.result(timeout=3) or []
+                except Exception as e:
+                    logger.warning(f"[Perf] card search failed/timeout: {e}")
+                try:
+                    vector_chunks = fut_vectors.result(timeout=3) or []
+                except Exception as e:
+                    logger.warning(f"[Perf] vector search failed/timeout: {e}")
+            logger.info(f"[Perf] vector+card search: {time.time()-_t_rag:.2f}s")
 
         if card_results:
             for card in card_results:
@@ -1189,13 +1218,15 @@ def build_messages(incoming_messages: list[dict], model: str) -> list[dict]:
                             f"= {len(vector_chunks)} chunks, {len(conv_groups)} conversations")
 
         # --- Fallback: LIKE keyword search (jieba, for what vectors missed) ---
-        if len(memory_lines) < HISTORY_SEARCH_LIMIT:
+        _elapsed = time.time() - _t_build_start
+        if len(memory_lines) < HISTORY_SEARCH_LIMIT and _elapsed < 4.0:
+            _t_like = time.time()
             like_query = extract_search_query(cleaned)
             if like_query:
                 remaining = HISTORY_SEARCH_LIMIT - len(memory_lines)
                 like_results = search_history(like_query, remaining, MAX_HISTORY_CHARS)
-                logger.info(f"[Memory] LIKE fallback: query='{like_query[:60]}', "
-                            f"{len(like_results)} results")
+                logger.info(f"[Perf] LIKE fallback: {time.time()-_t_like:.2f}s, "
+                            f"query='{like_query[:60]}', {len(like_results)} results")
                 for h in like_results:
                     date = h.get("created_at", "")[:10]
                     role_label = "淘淘" if h.get("role") == "user" else "你"
@@ -1203,6 +1234,8 @@ def build_messages(incoming_messages: list[dict], model: str) -> list[dict]:
                     ago = _days_ago(date)
                     ago_str = f"({ago}) " if ago else ""
                     memory_lines.append(f"[{date} {ago_str}] {role_label}: {snippet}")
+        elif _elapsed >= 4.0:
+            logger.warning(f"[Perf] LIKE fallback SKIPPED — time budget exceeded ({_elapsed:.2f}s)")
 
         # --- Inject memories with model-specific format ---
         if memory_lines:
@@ -1551,7 +1584,9 @@ def chat_completions():
                                    "type": "invalid_request_error"}}), 400
 
     provider_name = provider_cfg["provider"]
+    _t0_build = time.time()
     messages = build_messages(incoming_messages, model)
+    logger.info(f"[Perf] build_messages took {time.time() - _t0_build:.2f}s")
 
     # Extract user message for storage
     user_text = extract_latest_user_message(incoming_messages)
@@ -1617,7 +1652,9 @@ def chat_completions():
 
     # ---------- Normal flow (no tools) ----------
     # Call API with retry
+    _t_api = time.time()
     resp, error_resp = _call_with_retry(provider_cfg, messages, model, stream, extra)
+    logger.info(f"[Perf] API connect: {time.time() - _t_api:.2f}s")
     if error_resp:
         return error_resp
 
@@ -1627,6 +1664,8 @@ def chat_completions():
 
         def generate():
             assistant_text = []
+            _t_first_token = time.time()
+            _first_token_logged = False
             try:
                 resp.encoding = "utf-8"
 
@@ -1678,6 +1717,9 @@ def chat_completions():
                                 chunk_data = json.loads(line[6:])
                                 delta = chunk_data.get("choices", [{}])[0].get("delta", {})
                                 if delta.get("content"):
+                                    if not _first_token_logged:
+                                        logger.info(f"[Perf] first content token: {time.time()-_t_first_token:.2f}s after stream start")
+                                        _first_token_logged = True
                                     assistant_text.append(delta["content"])
                             except (json.JSONDecodeError, IndexError):
                                 pass
@@ -1686,6 +1728,7 @@ def chat_completions():
 
                     # Save assistant message after stream completes
                     full_text = "".join(t for t in assistant_text if t is not None)
+                    logger.info(f"[Perf] stream complete: {time.time()-_t_first_token:.2f}s total, {len(full_text)} chars")
                     if full_text.strip():
                         save_message(conversation_id, "assistant", full_text,
                                     model, provider_name)
