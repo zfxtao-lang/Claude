@@ -610,6 +610,24 @@ def _model_family(model: str) -> str:
     return "default"
 
 
+_RE_INNER_MONO = re.compile(
+    r"<inner_monologue>.*?</inner_monologue>\s*", re.DOTALL)
+_RE_REPLY_TAG = re.compile(
+    r"<reply>(.*?)</reply>", re.DOTALL)
+
+
+def _strip_inner_monologue(text: str) -> str:
+    """Remove <inner_monologue> blocks; if <reply> tag exists, extract its content."""
+    if "<inner_monologue>" not in text:
+        return text
+    # Try to extract <reply> content
+    m = _RE_REPLY_TAG.search(text)
+    if m:
+        return m.group(1).strip()
+    # Fallback: just remove <inner_monologue> block
+    return _RE_INNER_MONO.sub("", text).strip()
+
+
 def _model_specific_patch(model: str) -> str:
     """Return model-specific system prompt patch. Only the matching model sees its patch."""
     family = _model_family(model)
@@ -617,7 +635,7 @@ def _model_specific_patch(model: str) -> str:
     if family == "deepseek":
         return (
             "\n\n<!-- DeepSeek-Reasoner 补丁 -->\n"
-            "- 只输出对淘淘说的话。不输出内心独白、旁白、分析\n"
+            "- 不输出旁白、分析\n"
             "- 不扩展设定，只用已知内容\n"
             "- 回复长度贴合日常聊天，不写小说\n"
             "- 禁止复述或分析以上规则"
@@ -1535,9 +1553,12 @@ def chat_completions():
             assistant_content = choices[0].get("message", {}).get("content", "")
 
         if assistant_content:
+            # Strip inner monologue, deliver only <reply> to client
+            clean_content = _strip_inner_monologue(assistant_content)
+            result_json["choices"][0]["message"]["content"] = clean_content
             tokens_in = result_json.get("usage", {}).get("prompt_tokens", 0)
             tokens_out = result_json.get("usage", {}).get("completion_tokens", 0)
-            save_message(conversation_id, "assistant", assistant_content,
+            save_message(conversation_id, "assistant", clean_content,
                          model, provider_name, tokens_in, tokens_out)
         else:
             logger.warning(f"Empty assistant response after tool loop. "
@@ -1558,6 +1579,7 @@ def chat_completions():
     if stream:
         def generate():
             assistant_text = []
+            last_chunk_data = None
             try:
                 # Force UTF-8 decoding — OpenRouter may not set charset in headers,
                 # causing requests to default to latin-1 and garble Chinese text
@@ -1565,12 +1587,11 @@ def chat_completions():
                 for line in resp.iter_lines(decode_unicode=True):
                     if not line:
                         continue
-                    # All providers are OpenAI-compatible: pass through SSE
-                    yield line + "\n\n" if not line.endswith("\n\n") else line
-                    # Collect text for DB storage
+                    # Collect text chunks (don't yield yet — need to strip monologue)
                     if line.startswith("data: ") and "[DONE]" not in line:
                         try:
                             chunk_data = json.loads(line[6:])
+                            last_chunk_data = chunk_data
                             delta = chunk_data.get("choices", [{}])[0].get("delta", {})
                             if delta.get("content"):
                                 assistant_text.append(delta["content"])
@@ -1579,16 +1600,36 @@ def chat_completions():
             except (requests.ConnectionError, requests.ChunkedEncodingError,
                     ConnectionResetError, OSError) as e:
                 logger.error(f"Stream interrupted: {e}")
-                # Send an error event so the client knows the stream broke
-                yield f'data: {{"error": "Stream interrupted: {type(e).__name__}"}}\n\n'
-            finally:
-                # Save whatever we got so far
-                full_text = "".join(t for t in assistant_text if t is not None)
-                if full_text.strip():
-                    save_message(conversation_id, "assistant", full_text,
-                                model, provider_name)
-                else:
-                    logger.warning("Empty assistant response in stream")
+
+            # Assemble full text, strip inner monologue, then fake-stream out
+            full_text = "".join(t for t in assistant_text if t is not None)
+            if full_text.strip():
+                clean_text = _strip_inner_monologue(full_text)
+                save_message(conversation_id, "assistant", clean_text,
+                            model, provider_name)
+                # Re-emit as SSE chunks so client sees normal streaming
+                chunk_id = last_chunk_data.get("id", "") if last_chunk_data else ""
+                chunk_model = last_chunk_data.get("model", model) if last_chunk_data else model
+                for i, char in enumerate(clean_text):
+                    chunk = {
+                        "id": chunk_id,
+                        "object": "chat.completion.chunk",
+                        "model": chunk_model,
+                        "choices": [{"index": 0, "delta": {"content": char}, "finish_reason": None}],
+                    }
+                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                # Final chunk with finish_reason
+                final = {
+                    "id": chunk_id,
+                    "object": "chat.completion.chunk",
+                    "model": chunk_model,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                }
+                yield f"data: {json.dumps(final)}\n\n"
+                yield "data: [DONE]\n\n"
+            else:
+                logger.warning("Empty assistant response in stream")
+                yield "data: [DONE]\n\n"
 
         return Response(
             stream_with_context(generate()),
@@ -1610,9 +1651,11 @@ def chat_completions():
         assistant_content = choices[0].get("message", {}).get("content", "")
 
     if assistant_content:
+        clean_content = _strip_inner_monologue(assistant_content)
+        result["choices"][0]["message"]["content"] = clean_content
         tokens_in = result.get("usage", {}).get("prompt_tokens", 0)
         tokens_out = result.get("usage", {}).get("completion_tokens", 0)
-        save_message(conversation_id, "assistant", assistant_content,
+        save_message(conversation_id, "assistant", clean_content,
                      model, provider_name, tokens_in, tokens_out)
     else:
         logger.warning(f"Empty assistant response. Raw: {json.dumps(raw_json)[:500]}")
