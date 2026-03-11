@@ -1282,11 +1282,13 @@ def _tool_call_loop(provider_cfg, messages, model, extra, max_rounds):
         finish_reason = choices[0].get("finish_reason", "")
         tool_calls = message.get("tool_calls", [])
 
-        # No tool calls or finish_reason is "stop" → final response
-        if not tool_calls or finish_reason == "stop":
+        # No tool calls → final response
+        # NOTE: do NOT check finish_reason here. Some providers return
+        # finish_reason="stop" even with tool_calls present.
+        if not tool_calls:
             logger.info(f"[Tools] round {round_idx}: final response "
                         f"(finish_reason={finish_reason})")
-            # Strip tool_calls from the final response to not confuse the client
+            # Strip any leftover tool_calls from the final response
             if "tool_calls" in message:
                 del message["tool_calls"]
             return result, None
@@ -1611,6 +1613,76 @@ def refresh_notion():
     invalidate_cache()
     content = get_notion_content(force_refresh=True)
     return jsonify({"status": "refreshed", "content_length": len(content)})
+
+
+# ---------- Notion Tools Diagnostic ----------
+@app.route("/admin/notion/test", methods=["POST"])
+@require_auth
+def test_notion_tools():
+    """
+    Diagnostic endpoint to test Notion API connectivity and tool execution.
+    Body: {"action": "search", "params": {"query": "日记"}}
+    or:   {"action": "read_page", "params": {"page_id": "xxx"}}
+    or:   {"action": "append", "params": {"page_id": "xxx", "content": "test"}}
+    or:   {"action": "status"} — just check API connectivity
+    """
+    data = request.get_json(force=True)
+    action = data.get("action", "status")
+
+    from config import NOTION_TOKEN, NOTION_PAGE_IDS
+    from notion_tools import (
+        exec_notion_search, exec_notion_read_page,
+        exec_notion_append, NOTION_TOOLS,
+    )
+
+    result = {"action": action}
+
+    if action == "status":
+        # Basic connectivity check
+        result["notion_token_set"] = bool(NOTION_TOKEN)
+        result["notion_token_prefix"] = NOTION_TOKEN[:8] + "..." if NOTION_TOKEN else "(empty)"
+        result["notion_page_ids"] = NOTION_PAGE_IDS
+        result["tools_enabled"] = ENABLE_NOTION_TOOLS
+        result["tools_count"] = len(NOTION_TOOLS)
+        result["tool_names"] = [t["function"]["name"] for t in NOTION_TOOLS]
+
+        # Try a simple API call to verify token works
+        if NOTION_TOKEN:
+            import requests as req
+            try:
+                resp = req.get("https://api.notion.com/v1/users/me", headers={
+                    "Authorization": f"Bearer {NOTION_TOKEN}",
+                    "Notion-Version": "2022-06-28",
+                }, timeout=10)
+                result["api_status"] = resp.status_code
+                if resp.status_code == 200:
+                    me = resp.json()
+                    result["bot_name"] = me.get("name", "?")
+                    result["bot_type"] = me.get("type", "?")
+                else:
+                    result["api_error"] = resp.text[:300]
+            except Exception as e:
+                result["api_error"] = str(e)
+
+    elif action == "search":
+        params = data.get("params", {})
+        raw = exec_notion_search(params.get("query", ""))
+        result["raw_result"] = json.loads(raw)
+
+    elif action == "read_page":
+        params = data.get("params", {})
+        raw = exec_notion_read_page(params.get("page_id", ""))
+        result["raw_result"] = json.loads(raw)
+
+    elif action == "append":
+        params = data.get("params", {})
+        raw = exec_notion_append(params.get("page_id", ""), params.get("content", ""))
+        result["raw_result"] = json.loads(raw)
+
+    else:
+        result["error"] = f"Unknown action: {action}"
+
+    return jsonify(result)
 
 
 # ---------- Database Backup ----------
