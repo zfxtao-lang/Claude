@@ -137,8 +137,8 @@ def _do_nightly_vectorize():
 
 
 # ---------- Recent Context (cross-window awareness) ----------
-RECENT_CARD_DAYS = int(os.getenv("RECENT_CARD_DAYS", "3"))       # auto-inject cards from last N days
-RECENT_MSG_ROUNDS = int(os.getenv("RECENT_MSG_ROUNDS", "15"))    # today's cross-window messages (pairs)
+RECENT_CARD_DAYS = int(os.getenv("RECENT_CARD_DAYS", "2"))       # auto-inject cards from last N days
+RECENT_MSG_ROUNDS = int(os.getenv("RECENT_MSG_ROUNDS", "5"))     # today's cross-window messages (pairs)
 
 # ---------- Vector Search ----------
 VECTOR_MIN_SCORE = float(os.getenv("VECTOR_MIN_SCORE", "0.2"))
@@ -309,8 +309,8 @@ def build_recent_context(model: str) -> str | None:
             if not content or len(content) < 2:
                 continue
             # Truncate long messages
-            if len(content) > 300:
-                content = content[:300] + "..."
+            if len(content) > 150:
+                content = content[:150] + "..."
             label = "淘淘" if role == "user" else "小克"
             today_lines.append(f"{label}: {content}")
         if today_lines:
@@ -320,6 +320,9 @@ def build_recent_context(model: str) -> str | None:
         return None
 
     content = "\n\n".join(lines)
+    # Cap total recent context to avoid inflating DeepSeek thinking time
+    if len(content) > 3000:
+        content = content[:3000] + "\n...(truncated)"
 
     if family == "claude":
         return (
@@ -1282,7 +1285,9 @@ def build_messages(incoming_messages: list[dict], model: str) -> list[dict]:
         final_messages = _strip_image_content(final_messages)
 
     # --- Final structure log ---
+    total_chars = sum(len(str(m.get("content", ""))) for m in final_messages)
     roles_summary = [f"{i}:{m['role']}" for i, m in enumerate(final_messages)]
+    logger.info(f"[Perf] total context: ~{total_chars} chars (~{total_chars//2} tokens)")
     logger.info(f"[Memory] build_messages final: {len(final_messages)} msgs, "
                 f"memory@{memory_inject_idx} kelivo@{kelivo_start_idx} | "
                 f"{' '.join(roles_summary)}")

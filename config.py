@@ -73,8 +73,8 @@ NOTION_PAGE_IDS = os.getenv("NOTION_PAGE_IDS", "").split(",")  # comma-separated
 NOTION_CACHE_TTL = int(os.getenv("NOTION_CACHE_TTL", "3600"))  # seconds
 
 # ---------- History Retrieval ----------
-HISTORY_SEARCH_LIMIT = int(os.getenv("HISTORY_SEARCH_LIMIT", "5"))
-MAX_HISTORY_CHARS = int(os.getenv("MAX_HISTORY_CHARS", "4000"))
+HISTORY_SEARCH_LIMIT = int(os.getenv("HISTORY_SEARCH_LIMIT", "3"))
+MAX_HISTORY_CHARS = int(os.getenv("MAX_HISTORY_CHARS", "2000"))
 
 # ---------- Rate Limiting ----------
 RATE_LIMIT_RPM = int(os.getenv("RATE_LIMIT_RPM", "30"))       # requests per minute
