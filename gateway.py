@@ -52,7 +52,8 @@ from database import (
     search_history, start_writer,
 )
 from embedding import (
-    get_embedding, get_embeddings_batch, vector_store, card_vector_store,
+    get_embedding, get_embedding_for_query, get_embeddings_batch,
+    vector_store, card_vector_store,
 )
 from memory_cards import (
     embed_pending_cards, generate_card_for_date, generate_cards_batch,
@@ -1070,7 +1071,7 @@ def build_messages(incoming_messages: list[dict], model: str) -> list[dict]:
 
     def _fetch_embedding():
         if raw_user_msg:
-            return get_embedding(raw_user_msg)
+            return get_embedding_for_query(raw_user_msg)
         return None
 
     with ThreadPoolExecutor(max_workers=3) as pool:

@@ -5,10 +5,12 @@ Uses Alibaba text-embedding-v3 (768 dimensions) for embeddings.
 Stores vectors in a numpy .npy file + metadata in SQLite.
 Designed for 2C2G servers: ~30MB memory for 10K chunks.
 """
+import hashlib
 import logging
 import os
 import threading
 import time
+from collections import OrderedDict
 
 import numpy as np
 import requests
@@ -16,6 +18,11 @@ import requests
 from config import DB_PATH
 
 logger = logging.getLogger(__name__)
+
+# ---------- Query Embedding Cache ----------
+_QUERY_CACHE_MAX = 128  # max cached query embeddings
+_query_cache: OrderedDict[str, np.ndarray] = OrderedDict()
+_query_cache_lock = threading.Lock()
 
 # ---------- Configuration ----------
 EMBEDDING_API_KEY = os.getenv("ALIBABA_API_KEY", "")
@@ -109,6 +116,80 @@ def get_embeddings_batch(texts: list[str]) -> list[np.ndarray | None]:
             logger.error("[Vector] batch embedding failed", exc_info=True)
 
     return results
+
+
+# ---------- Query Embedding (cached + 3s timeout) ----------
+
+QUERY_EMBEDDING_TIMEOUT = int(os.getenv("QUERY_EMBEDDING_TIMEOUT", "3"))
+
+
+def get_embedding_for_query(text: str) -> np.ndarray | None:
+    """
+    Get embedding for a user query with:
+    1. In-memory LRU cache — same question won't hit API twice
+    2. 3-second timeout — fail fast, let caller fall back to LIKE search
+
+    For pre-computed chunk/card embeddings, use get_embedding() or
+    get_embeddings_batch() instead (those use longer timeouts for batch jobs).
+    """
+    if not EMBEDDING_API_KEY or not text:
+        return None
+
+    text = text[:8000].strip()
+    if not text:
+        return None
+
+    # --- Cache lookup ---
+    cache_key = hashlib.md5(text.encode("utf-8")).hexdigest()
+    with _query_cache_lock:
+        if cache_key in _query_cache:
+            _query_cache.move_to_end(cache_key)
+            logger.info("[Vector] query embedding cache HIT")
+            return _query_cache[cache_key].copy()
+
+    # --- API call with short timeout ---
+    t0 = time.time()
+    try:
+        resp = requests.post(
+            f"{EMBEDDING_BASE_URL}/embeddings",
+            headers={
+                "Authorization": f"Bearer {EMBEDDING_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": EMBEDDING_MODEL,
+                "input": text,
+                "dimensions": EMBEDDING_DIMENSIONS,
+            },
+            timeout=QUERY_EMBEDDING_TIMEOUT,
+        )
+        elapsed = time.time() - t0
+        if resp.status_code != 200:
+            logger.error(f"[Vector] query embedding error {resp.status_code} "
+                         f"({elapsed:.1f}s): {resp.text[:200]}")
+            return None
+
+        data = resp.json()
+        vec = np.array(data["data"][0]["embedding"], dtype=np.float32)
+        logger.info(f"[Vector] query embedding OK ({elapsed:.1f}s), caching")
+
+        # --- Store in cache ---
+        with _query_cache_lock:
+            _query_cache[cache_key] = vec.copy()
+            while len(_query_cache) > _QUERY_CACHE_MAX:
+                _query_cache.popitem(last=False)
+
+        return vec
+
+    except requests.exceptions.Timeout:
+        elapsed = time.time() - t0
+        logger.warning(f"[Vector] query embedding TIMEOUT after {elapsed:.1f}s "
+                       f"(limit={QUERY_EMBEDDING_TIMEOUT}s), will fall back to LIKE")
+        return None
+    except Exception:
+        elapsed = time.time() - t0
+        logger.error(f"[Vector] query embedding failed ({elapsed:.1f}s)", exc_info=True)
+        return None
 
 
 # ---------- Vector Store (numpy-based) ----------
