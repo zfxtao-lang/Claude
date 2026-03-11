@@ -59,7 +59,14 @@ from memory_cards import (
     search_memory_cards,
 )
 from notion_cache import get_notion_content, invalidate_cache
-from notion_tools import NOTION_TOOLS, execute_tool_call
+try:
+    from notion_tools import NOTION_TOOLS, execute_tool_call
+except ImportError as _e:
+    logging.getLogger(__name__).error(f"Failed to import notion_tools: {_e}")
+    NOTION_TOOLS = []
+    def execute_tool_call(name, args):
+        import json
+        return json.dumps({"error": "notion_tools not available"})
 
 # ---------- App Setup ----------
 app = Flask(__name__)
@@ -81,6 +88,16 @@ _http_session.mount("http://", _adapter)
 
 init_db()
 start_writer()  # Start async DB write thread
+
+# ---------- Startup: confirm Notion tools status ----------
+logger.info(f"[Startup] ENABLE_NOTION_TOOLS={ENABLE_NOTION_TOOLS}, "
+            f"MAX_TOOL_ROUNDS={MAX_TOOL_ROUNDS}, "
+            f"notion_tools imported={'NOTION_TOOLS' in dir()}")
+try:
+    from notion_tools import NOTION_TOOLS as _nt_check
+    logger.info(f"[Startup] Notion tools loaded: {[t['function']['name'] for t in _nt_check]}")
+except Exception as e:
+    logger.error(f"[Startup] Failed to import notion_tools: {e}")
 
 
 # ---------- Background Embedding Worker ----------
@@ -384,6 +401,11 @@ def health():
         "status": "ok",
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "providers": provider_status,
+        "notion_tools": {
+            "enabled": ENABLE_NOTION_TOOLS,
+            "tools_loaded": len(NOTION_TOOLS),
+            "tool_names": [t["function"]["name"] for t in NOTION_TOOLS] if NOTION_TOOLS else [],
+        },
     })
 
 
@@ -1616,20 +1638,25 @@ def refresh_notion():
 
 
 # ---------- Notion Tools Diagnostic ----------
-@app.route("/admin/notion/test", methods=["POST"])
+@app.route("/admin/notion/test", methods=["GET", "POST"])
 @require_auth
 def test_notion_tools():
     """
     Diagnostic endpoint to test Notion API connectivity and tool execution.
-    Body: {"action": "search", "params": {"query": "日记"}}
+    GET: returns status (no body needed)
+    POST body: {"action": "search", "params": {"query": "日记"}}
     or:   {"action": "read_page", "params": {"page_id": "xxx"}}
     or:   {"action": "append", "params": {"page_id": "xxx", "content": "test"}}
     or:   {"action": "status"} — just check API connectivity
     """
-    data = request.get_json(force=True)
-    action = data.get("action", "status")
+    if request.method == "GET":
+        action = "status"
+        data = {}
+    else:
+        data = request.get_json(force=True)
+        action = data.get("action", "status")
 
-    from config import NOTION_TOKEN, NOTION_PAGE_IDS
+    # Use top-level imports (already imported at module level)
     from notion_tools import (
         exec_notion_search, exec_notion_read_page,
         exec_notion_append, NOTION_TOOLS,
@@ -1639,19 +1666,19 @@ def test_notion_tools():
 
     if action == "status":
         # Basic connectivity check
-        result["notion_token_set"] = bool(NOTION_TOKEN)
-        result["notion_token_prefix"] = NOTION_TOKEN[:8] + "..." if NOTION_TOKEN else "(empty)"
-        result["notion_page_ids"] = NOTION_PAGE_IDS
+        token = NOTION_TOKEN if NOTION_TOKEN else config.NOTION_TOKEN
+        result["notion_token_set"] = bool(token)
+        result["notion_token_prefix"] = token[:8] + "..." if token else "(empty)"
+        result["notion_page_ids"] = config.NOTION_PAGE_IDS
         result["tools_enabled"] = ENABLE_NOTION_TOOLS
         result["tools_count"] = len(NOTION_TOOLS)
         result["tool_names"] = [t["function"]["name"] for t in NOTION_TOOLS]
 
         # Try a simple API call to verify token works
-        if NOTION_TOKEN:
-            import requests as req
+        if token:
             try:
-                resp = req.get("https://api.notion.com/v1/users/me", headers={
-                    "Authorization": f"Bearer {NOTION_TOKEN}",
+                resp = _http_session.get("https://api.notion.com/v1/users/me", headers={
+                    "Authorization": f"Bearer {token}",
                     "Notion-Version": "2022-06-28",
                 }, timeout=10)
                 result["api_status"] = resp.status_code
