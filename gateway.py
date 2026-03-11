@@ -1623,59 +1623,78 @@ def chat_completions():
 
     # ---------- Streaming response ----------
     if stream:
+        needs_monologue_strip = _model_family(model) == "claude"
+
         def generate():
             assistant_text = []
-            last_chunk_data = None
             try:
-                # Force UTF-8 decoding — OpenRouter may not set charset in headers,
-                # causing requests to default to latin-1 and garble Chinese text
                 resp.encoding = "utf-8"
-                for line in resp.iter_lines(decode_unicode=True):
-                    if not line:
-                        continue
-                    # Collect text chunks (don't yield yet — need to strip monologue)
-                    if line.startswith("data: ") and "[DONE]" not in line:
-                        try:
-                            chunk_data = json.loads(line[6:])
-                            last_chunk_data = chunk_data
-                            delta = chunk_data.get("choices", [{}])[0].get("delta", {})
-                            if delta.get("content"):
-                                assistant_text.append(delta["content"])
-                        except (json.JSONDecodeError, IndexError):
-                            pass
+
+                if needs_monologue_strip:
+                    # Claude models may output <inner_monologue> — buffer full
+                    # response, strip, then re-emit (slower but necessary)
+                    last_chunk_data = None
+                    for line in resp.iter_lines(decode_unicode=True):
+                        if not line:
+                            continue
+                        if line.startswith("data: ") and "[DONE]" not in line:
+                            try:
+                                chunk_data = json.loads(line[6:])
+                                last_chunk_data = chunk_data
+                                delta = chunk_data.get("choices", [{}])[0].get("delta", {})
+                                if delta.get("content"):
+                                    assistant_text.append(delta["content"])
+                            except (json.JSONDecodeError, IndexError):
+                                pass
+
+                    full_text = "".join(t for t in assistant_text if t is not None)
+                    if full_text.strip():
+                        clean_text = _strip_inner_monologue(full_text)
+                        save_message(conversation_id, "assistant", clean_text,
+                                    model, provider_name)
+                        chunk_id = last_chunk_data.get("id", "") if last_chunk_data else ""
+                        chunk_model = last_chunk_data.get("model", model) if last_chunk_data else model
+                        for char in clean_text:
+                            chunk = {
+                                "id": chunk_id,
+                                "object": "chat.completion.chunk",
+                                "model": chunk_model,
+                                "choices": [{"index": 0, "delta": {"content": char}, "finish_reason": None}],
+                            }
+                            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                        yield f"data: {json.dumps({'id': chunk_id, 'object': 'chat.completion.chunk', 'model': chunk_model, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
+                        yield "data: [DONE]\n\n"
+                    else:
+                        logger.warning("Empty assistant response in stream (claude buffered)")
+                        yield "data: [DONE]\n\n"
+                else:
+                    # Non-Claude models: pass through stream directly in real-time
+                    # No buffering — user sees tokens as they arrive from upstream
+                    for line in resp.iter_lines(decode_unicode=True):
+                        if not line:
+                            continue
+                        if line.startswith("data: ") and "[DONE]" not in line:
+                            try:
+                                chunk_data = json.loads(line[6:])
+                                delta = chunk_data.get("choices", [{}])[0].get("delta", {})
+                                if delta.get("content"):
+                                    assistant_text.append(delta["content"])
+                            except (json.JSONDecodeError, IndexError):
+                                pass
+                        # Forward every line (including [DONE]) to client immediately
+                        yield line + "\n\n"
+
+                    # Save assistant message after stream completes
+                    full_text = "".join(t for t in assistant_text if t is not None)
+                    if full_text.strip():
+                        save_message(conversation_id, "assistant", full_text,
+                                    model, provider_name)
+                    else:
+                        logger.warning("Empty assistant response in stream (passthrough)")
+
             except (requests.ConnectionError, requests.ChunkedEncodingError,
                     ConnectionResetError, OSError) as e:
                 logger.error(f"Stream interrupted: {e}")
-
-            # Assemble full text, strip inner monologue, then fake-stream out
-            full_text = "".join(t for t in assistant_text if t is not None)
-            if full_text.strip():
-                clean_text = _strip_inner_monologue(full_text)
-                save_message(conversation_id, "assistant", clean_text,
-                            model, provider_name)
-                # Re-emit as SSE chunks so client sees normal streaming
-                chunk_id = last_chunk_data.get("id", "") if last_chunk_data else ""
-                chunk_model = last_chunk_data.get("model", model) if last_chunk_data else model
-                for i, char in enumerate(clean_text):
-                    chunk = {
-                        "id": chunk_id,
-                        "object": "chat.completion.chunk",
-                        "model": chunk_model,
-                        "choices": [{"index": 0, "delta": {"content": char}, "finish_reason": None}],
-                    }
-                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-                # Final chunk with finish_reason
-                final = {
-                    "id": chunk_id,
-                    "object": "chat.completion.chunk",
-                    "model": chunk_model,
-                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                }
-                yield f"data: {json.dumps(final)}\n\n"
-                yield "data: [DONE]\n\n"
-            else:
-                logger.warning("Empty assistant response in stream")
-                yield "data: [DONE]\n\n"
 
         return Response(
             stream_with_context(generate()),
