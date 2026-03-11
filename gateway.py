@@ -1508,14 +1508,18 @@ def chat_completions():
     # ---------- Inject Notion tools if model supports them ----------
     tools_supported = _model_supports_tools(model)
     client_has_tools = "tools" in extra
-    use_tools = (ENABLE_NOTION_TOOLS and tools_supported and not client_has_tools)
+    use_tools = (ENABLE_NOTION_TOOLS and tools_supported)
     logger.info(f"[Tools] decision: ENABLE={ENABLE_NOTION_TOOLS}, "
                 f"model_supports={tools_supported}(model={model}), "
                 f"client_has_tools={client_has_tools} → use_tools={use_tools}")
     if use_tools:
-        extra["tools"] = NOTION_TOOLS
+        if client_has_tools:
+            extra["tools"] = extra["tools"] + NOTION_TOOLS
+        else:
+            extra["tools"] = NOTION_TOOLS
         extra["tool_choice"] = "auto"
-        logger.info(f"[Tools] injected {len(NOTION_TOOLS)} Notion tools for {model}")
+        logger.info(f"[Tools] injected {len(NOTION_TOOLS)} Notion tools for {model}"
+                     f" (merged with client tools: {client_has_tools})")
 
     # ---------- Tool call loop (non-streaming internally) ----------
     if use_tools:
