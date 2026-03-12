@@ -11,6 +11,7 @@ Requires environment variables:
 import json
 import logging
 import os
+import uuid
 from datetime import datetime, timedelta, timezone
 
 import caldav
@@ -78,6 +79,7 @@ def _get_calendar():
     if not CALDAV_USERNAME or not CALDAV_PASSWORD:
         raise RuntimeError("CalDAV credentials not configured (CALDAV_USERNAME / CALDAV_PASSWORD)")
 
+    logger.info(f"[Calendar] connecting to {CALDAV_URL} as {CALDAV_USERNAME[:3]}***")
     client = caldav.DAVClient(
         url=CALDAV_URL,
         username=CALDAV_USERNAME,
@@ -85,6 +87,8 @@ def _get_calendar():
     )
     principal = client.principal()
     calendars = principal.calendars()
+    logger.info(f"[Calendar] found {len(calendars)} calendars: "
+                f"{[c.name for c in calendars]}")
 
     # Find the target calendar by name
     for cal in calendars:
@@ -166,23 +170,30 @@ def execute_add_calendar_event(arguments: dict) -> str:
     if end_dt.tzinfo is None:
         end_dt = end_dt.replace(tzinfo=CST)
 
-    # Build VCALENDAR
-    # Use VALARM for a 15-minute reminder
+    # Build VCALENDAR (RFC 5545 compliant)
+    event_uid = str(uuid.uuid4())
+    now_utc = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+    # Convert to UTC for maximum compatibility with iCloud
+    start_utc = start_dt.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    end_utc = end_dt.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
     vevent_lines = [
         "BEGIN:VCALENDAR",
         "VERSION:2.0",
         "PRODID:-//XiaoKe//Calendar//CN",
         "BEGIN:VEVENT",
-        f"DTSTART:{start_dt.strftime('%Y%m%dT%H%M%S')}",
-        f"DTEND:{end_dt.strftime('%Y%m%dT%H%M%S')}",
+        f"UID:{event_uid}",
+        f"DTSTAMP:{now_utc}",
+        f"DTSTART:{start_utc}",
+        f"DTEND:{end_utc}",
         f"SUMMARY:{title}",
     ]
     if description:
-        # Escape newlines for iCal format
         safe_desc = description.replace("\n", "\\n").replace(",", "\\,")
         vevent_lines.append(f"DESCRIPTION:{safe_desc}")
 
-    # Add a 15-minute reminder alarm
+    # 15-minute reminder alarm
     vevent_lines.extend([
         "BEGIN:VALARM",
         "TRIGGER:-PT15M",
@@ -196,8 +207,11 @@ def execute_add_calendar_event(arguments: dict) -> str:
 
     try:
         cal = _get_calendar()
-        cal.save_event(vcal_str)
-        logger.info(f"[Calendar] event created: '{title}' at {start_dt.isoformat()}")
+        logger.info(f"[Calendar] saving event UID={event_uid}, title='{title}', "
+                     f"start={start_utc}, end={end_utc}")
+        event = cal.save_event(vcal_str)
+        logger.info(f"[Calendar] event created OK: '{title}' at {start_dt.isoformat()}, "
+                     f"url={getattr(event, 'url', 'n/a')}")
         return json.dumps({
             "success": True,
             "title": title,
