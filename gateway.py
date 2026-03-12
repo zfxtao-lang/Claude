@@ -61,13 +61,20 @@ from memory_cards import (
 )
 from notion_cache import get_notion_content, invalidate_cache
 try:
-    from notion_tools import NOTION_TOOLS, execute_tool_call
+    from notion_tools import NOTION_TOOLS, execute_tool_call as execute_notion_tool
 except ImportError as _e:
     logging.getLogger(__name__).error(f"Failed to import notion_tools: {_e}")
     NOTION_TOOLS = []
-    def execute_tool_call(name, args):
+    def execute_notion_tool(name, args):
         import json
         return json.dumps({"error": "notion_tools not available"})
+try:
+    from memory_tools import MEMORY_TOOLS, execute_search_memory
+except ImportError as _e:
+    logging.getLogger(__name__).error(f"Failed to import memory_tools: {_e}")
+    MEMORY_TOOLS = []
+    def execute_search_memory(query):
+        return "记忆搜索功能暂时不可用。"
 
 # ---------- App Setup ----------
 app = Flask(__name__)
@@ -147,6 +154,7 @@ VECTOR_EXCLUDE_HOURS = int(os.getenv("VECTOR_EXCLUDE_HOURS", "2"))
 
 # ---------- Function Calling (Notion Tools) ----------
 ENABLE_NOTION_TOOLS = os.getenv("ENABLE_NOTION_TOOLS", "true").lower() in ("true", "1", "yes")
+ENABLE_MEMORY_SEARCH = os.getenv("ENABLE_MEMORY_SEARCH", "true").lower() in ("true", "1", "yes")
 MAX_TOOL_ROUNDS = int(os.getenv("MAX_TOOL_ROUNDS", "3"))  # max tool call iterations per request
 
 # Models that support function calling (prefix match)
@@ -174,8 +182,9 @@ def _model_supports_tools(model: str) -> bool:
 
 # ---------- Startup: confirm Notion tools status ----------
 logger.info(f"[Startup] ENABLE_NOTION_TOOLS={ENABLE_NOTION_TOOLS}, "
+            f"ENABLE_MEMORY_SEARCH={ENABLE_MEMORY_SEARCH}, "
             f"MAX_TOOL_ROUNDS={MAX_TOOL_ROUNDS}, "
-            f"NOTION_TOOLS loaded={len(NOTION_TOOLS)} tools")
+            f"NOTION_TOOLS={len(NOTION_TOOLS)}, MEMORY_TOOLS={len(MEMORY_TOOLS)}")
 
 
 def vector_search_memories(query: str, top_k: int = 5,
@@ -1065,79 +1074,45 @@ def _trim_messages_to_fit(messages: list[dict], max_chars: int) -> list[dict]:
 # ---------- Build Messages ----------
 def build_messages(incoming_messages: list[dict], model: str) -> list[dict]:
     """
-    Build the final message list:
-    - system(persona) → system(Notion) → system(memories) → Kelivo messages
-    - Memories placed BEFORE today's chat so model reads them first
-    - Excludes recent 24h from search to avoid self-pollution
+    Build the final message list (v5.0 Lite):
+    - system(persona + recent_summary + model patch + time) → Kelivo messages
+    - Memory retrieval is on-demand via search_memory tool (no auto-RAG)
+    - Notion injection removed (tools still available via function calling)
     """
-    from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FutTimeout
-
     _t_build_start = time.time()
     system_prompt = load_system_prompt()
 
     # Filter out Kelivo junk
     cleaned = filter_kelivo_messages(incoming_messages)
-    raw_user_msg = extract_latest_user_message(cleaned)
 
-    # --- Parallel fetch: Notion, recent context, embedding (all independent) ---
-    notion_content = None
+    # --- Fetch recent context for {{RECENT_SUMMARY}} placeholder ---
     recent_ctx = None
-    query_vec = None
     _t_parallel = time.time()
+    try:
+        recent_ctx = build_recent_context(model)
+    except Exception as e:
+        logger.warning(f"[Perf] recent_ctx fetch failed: {e}")
 
-    def _fetch_notion():
-        _t = time.time()
-        r = get_notion_content()
-        logger.info(f"[Perf]   notion: {time.time()-_t:.2f}s")
-        return r
+    logger.info(f"[Perf] context fetch: {time.time()-_t_parallel:.2f}s "
+                f"(recent_ctx={'yes' if recent_ctx else 'no'})")
 
-    def _fetch_recent_ctx():
-        _t = time.time()
-        r = build_recent_context(model)
-        logger.info(f"[Perf]   recent_ctx: {time.time()-_t:.2f}s")
-        return r
-
-    def _fetch_embedding():
-        if raw_user_msg:
-            _t = time.time()
-            r = get_embedding_for_query(raw_user_msg)
-            logger.info(f"[Perf]   embedding: {time.time()-_t:.2f}s")
-            return r
-        return None
-
-    with ThreadPoolExecutor(max_workers=3) as pool:
-        fut_notion = pool.submit(_fetch_notion)
-        fut_recent = pool.submit(_fetch_recent_ctx)
-        fut_embed = pool.submit(_fetch_embedding)
-
-        try:
-            notion_content = fut_notion.result(timeout=5)
-        except (FutTimeout, Exception) as e:
-            logger.warning(f"[Perf] notion fetch timed out or failed: {e}")
-        try:
-            recent_ctx = fut_recent.result(timeout=3)
-        except (FutTimeout, Exception) as e:
-            logger.warning(f"[Perf] recent_ctx fetch timed out or failed: {e}")
-        try:
-            query_vec = fut_embed.result(timeout=4)
-        except (FutTimeout, Exception) as e:
-            logger.warning(f"[Perf] embedding fetch timed out or failed: {e}")
-
-    logger.info(f"[Perf] parallel fetch total: {time.time()-_t_parallel:.2f}s "
-                f"(notion={'yes' if notion_content else 'no'}, "
-                f"recent_ctx={'yes' if recent_ctx else 'no'}, "
-                f"embedding={'yes' if query_vec is not None else 'no'})")
-
-    # Message structure (top-down, model reads in this order):
-    #   1. system(persona + model-specific patch) — highest weight
-    #   2. system(Notion core memory)
-    #   2.5. system(recent context) — cross-window awareness (last N days + today's chats)
-    #   3. system(retrieved memories) — model sees old memories BEFORE today's chat
-    #   4. Kelivo user/assistant messages (today's conversation)
+    # Message structure (v5.0 Lite):
+    #   1. system(persona + {{RECENT_SUMMARY}} filled + model patch + time)
+    #   2. Kelivo user/assistant messages (today's conversation)
+    #   Memory retrieval is now on-demand via search_memory tool.
     final_messages = []
 
-    # --- 1. Persona + model-specific patch + current time ---
+    # --- 1. Persona + recent summary + model-specific patch + current time ---
     if system_prompt:
+        # Fill {{RECENT_SUMMARY}} placeholder with recent context
+        if recent_ctx and "{{RECENT_SUMMARY}}" in system_prompt:
+            # Strip model-specific wrapper, just use the content
+            summary_text = recent_ctx
+            system_prompt = system_prompt.replace("{{RECENT_SUMMARY}}", summary_text)
+            logger.info(f"[RecentSummary] filled {{RECENT_SUMMARY}} ({len(summary_text)} chars)")
+        elif "{{RECENT_SUMMARY}}" in system_prompt:
+            system_prompt = system_prompt.replace("{{RECENT_SUMMARY}}", "（暂无近期摘要）")
+
         patch = _model_specific_patch(model)
         beijing_tz = timezone(timedelta(hours=8))
         now_bj = datetime.now(beijing_tz)
@@ -1146,135 +1121,10 @@ def build_messages(incoming_messages: list[dict], model: str) -> list[dict]:
         time_line = f"\n\n【当前时间】{now_str}"
         final_messages.append({"role": "system", "content": system_prompt + patch + time_line})
 
-    # --- 2. Notion knowledge base ---
-    if notion_content:
-        truncated_notion = notion_content[:MAX_NOTION_CHARS]
-        if len(notion_content) > MAX_NOTION_CHARS:
-            truncated_notion += "\n...(truncated)"
-        final_messages.append({
-            "role": "system",
-            "content": f"[Core Memory from Knowledge Base]\n{truncated_notion}",
-        })
+    # --- Memory retrieval is now on-demand via search_memory tool ---
+    # No automatic RAG injection. The model calls search_memory when needed.
 
-    # --- 2.5. Recent context (cross-window awareness, unconditional) ---
-    if recent_ctx:
-        final_messages.append({
-            "role": "system",
-            "content": recent_ctx,
-        })
-        logger.info(f"[RecentCtx] injected recent context ({len(recent_ctx)} chars)")
-
-    # --- 3. Retrieved memories (placed BEFORE today's chat) ---
-    # Vector search: uses RAW user message (semantic understanding, no jieba needed)
-    # LIKE fallback: uses jieba-extracted keywords (catches what vectors miss)
-    memory_inject_idx = len(final_messages)
-    memory_lines = []
-
-    if raw_user_msg:
-        # --- Layer 1 & 2: Card search + Vector search in parallel (reuse embedding) ---
-        logger.info(f"[Memory] query (raw): '{raw_user_msg[:80]}'")
-        _t_rag = time.time()
-
-        card_results = []
-        vector_chunks = []
-
-        if query_vec is not None:
-            with ThreadPoolExecutor(max_workers=2) as pool:
-                fut_cards = pool.submit(search_memory_cards, raw_user_msg, 3, 0.25, query_vec)
-                fut_vectors = pool.submit(vector_search_memories, raw_user_msg,
-                                          HISTORY_SEARCH_LIMIT, None, query_vec)
-                try:
-                    card_results = fut_cards.result(timeout=3) or []
-                except Exception as e:
-                    logger.warning(f"[Perf] card search failed/timeout: {e}")
-                try:
-                    vector_chunks = fut_vectors.result(timeout=3) or []
-                except Exception as e:
-                    logger.warning(f"[Perf] vector search failed/timeout: {e}")
-            logger.info(f"[Perf] vector+card search: {time.time()-_t_rag:.2f}s")
-
-        if card_results:
-            for card in card_results:
-                date = card.get("date", "?")
-                score = card.get("score", 0)
-                summary = card.get("summary", "")
-                tags = card.get("tags", "")
-                tag_str = f" #{tags}" if tags else ""
-                ago = _days_ago(date)
-                ago_str = f"({ago}) " if ago else ""
-                memory_lines.append(f"[{date} {ago_str}记忆卡片 相关度:{score:.0%}{tag_str}]\n{summary}")
-            logger.info(f"[Memory] card search: {len(card_results)} cards matched")
-
-        # --- Layer 2: Process vector chunks (already fetched in parallel) ---
-        remaining_slots = HISTORY_SEARCH_LIMIT - len(memory_lines)
-        if remaining_slots > 0 and vector_chunks:
-            # Trim to remaining slots
-            vector_chunks = vector_chunks[:remaining_slots * 3]  # keep headroom for grouping
-            if vector_chunks:
-                from collections import OrderedDict
-                conv_groups: dict[str, list[dict]] = OrderedDict()
-                for vc in vector_chunks:
-                    cid = vc.get("conversation_id", "?")
-                    if cid not in conv_groups:
-                        conv_groups[cid] = []
-                    conv_groups[cid].append(vc)
-
-                for conv_id, chunks in conv_groups.items():
-                    chunks.sort(key=lambda c: c.get("msg_id_start", 0))
-                    parts = []
-                    for vc in chunks:
-                        content = (vc.get("content", "") or "")[:600]
-                        parts.append(content)
-                    date = chunks[0].get("created_at", "")[:10]
-                    best_score = max(c.get("score", 0) for c in chunks)
-                    combined = "\n".join(parts)
-                    ago = _days_ago(date)
-                    ago_str = f"({ago}) " if ago else ""
-                    memory_lines.append(f"[{date} {ago_str}相关度:{best_score:.0%}]\n{combined}")
-
-                direct = sum(1 for vc in vector_chunks if vc.get("match_type") == "direct")
-                context = sum(1 for vc in vector_chunks if vc.get("match_type") == "context")
-                logger.info(f"[Memory] vector search: {direct} direct + {context} context "
-                            f"= {len(vector_chunks)} chunks, {len(conv_groups)} conversations")
-
-        # --- Fallback: LIKE keyword search (jieba, for what vectors missed) ---
-        _elapsed = time.time() - _t_build_start
-        if len(memory_lines) < HISTORY_SEARCH_LIMIT and _elapsed < 4.0:
-            _t_like = time.time()
-            like_query = extract_search_query(cleaned)
-            if like_query:
-                remaining = HISTORY_SEARCH_LIMIT - len(memory_lines)
-                like_results = search_history(like_query, remaining, MAX_HISTORY_CHARS)
-                logger.info(f"[Perf] LIKE fallback: {time.time()-_t_like:.2f}s, "
-                            f"query='{like_query[:60]}', {len(like_results)} results")
-                for h in like_results:
-                    date = h.get("created_at", "")[:10]
-                    role_label = "淘淘" if h.get("role") == "user" else "你"
-                    snippet = (h.get("content", "") or "")[:200]
-                    ago = _days_ago(date)
-                    ago_str = f"({ago}) " if ago else ""
-                    memory_lines.append(f"[{date} {ago_str}] {role_label}: {snippet}")
-        elif _elapsed >= 4.0:
-            logger.warning(f"[Perf] LIKE fallback SKIPPED — time budget exceeded ({_elapsed:.2f}s)")
-
-        # --- Inject memories with model-specific format ---
-        if memory_lines:
-            memory_content = "\n\n".join(memory_lines)
-            memory_text = _format_memory_for_model(model, memory_content)
-            final_messages.append({
-                "role": "user",
-                "content": memory_text,
-            })
-            logger.info(f"[Memory] injected {len(memory_lines)} memories at position "
-                        f"{memory_inject_idx} (before Kelivo messages, format={_model_family(model)})")
-        else:
-            logger.info(f"[Memory] no results from vector or LIKE search "
-                        f"for raw query: '{raw_user_msg[:60]}'")
-    else:
-        logger.info("[Memory] no user message found, skipping memory retrieval")
-
-    # --- 4. Today's conversation from Kelivo ---
-    kelivo_start_idx = len(final_messages)
+    # --- 2. Today's conversation from Kelivo ---
     kelivo_msgs = [msg for msg in cleaned if msg["role"] != "system"]
 
     # --- Context window management ---
@@ -1305,9 +1155,7 @@ def build_messages(incoming_messages: list[dict], model: str) -> list[dict]:
     total_chars = sum(len(str(m.get("content", ""))) for m in final_messages)
     roles_summary = [f"{i}:{m['role']}" for i, m in enumerate(final_messages)]
     logger.info(f"[Perf] total context: ~{total_chars} chars (~{total_chars//2} tokens)")
-    logger.info(f"[Memory] build_messages final: {len(final_messages)} msgs, "
-                f"memory@{memory_inject_idx} kelivo@{kelivo_start_idx} | "
-                f"{' '.join(roles_summary)}")
+    logger.info(f"[Build] final: {len(final_messages)} msgs | {' '.join(roles_summary)}")
 
     return final_messages
 
@@ -1392,6 +1240,18 @@ def _call_with_retry(provider_cfg, messages, model, stream, extra):
                                       "type": "api_error"}}), 502)
 
 
+def _dispatch_tool_call(tool_name: str, arguments: dict) -> str:
+    """Route tool calls to the appropriate handler."""
+    if tool_name == "search_memory":
+        query = arguments.get("query", "")
+        if not query:
+            return "请提供搜索关键词。"
+        return execute_search_memory(query)
+    else:
+        # Assume it's a Notion tool
+        return execute_notion_tool(tool_name, arguments)
+
+
 def _tool_call_loop(provider_cfg, messages, model, extra, max_rounds):
     """
     Non-streaming tool call loop.
@@ -1469,7 +1329,7 @@ def _tool_call_loop(provider_cfg, messages, model, extra, max_rounds):
                 arguments = {}
 
             logger.info(f"[Tools] executing {tool_name}({json.dumps(arguments, ensure_ascii=False)[:200]})")
-            tool_result = execute_tool_call(tool_name, arguments)
+            tool_result = _dispatch_tool_call(tool_name, arguments)
             logger.info(f"[Tools] {tool_name} result: {tool_result[:300]}")
 
             # Add tool result message
@@ -1626,21 +1486,28 @@ def chat_completions():
         if key in data:
             extra[key] = data[key]
 
-    # ---------- Inject Notion tools if model supports them ----------
+    # ---------- Inject tools (Notion + search_memory) if model supports them ----------
     tools_supported = _model_supports_tools(model)
     client_has_tools = "tools" in extra
-    use_tools = (ENABLE_NOTION_TOOLS and tools_supported)
-    logger.info(f"[Tools] decision: ENABLE={ENABLE_NOTION_TOOLS}, "
+    all_tools = []
+    if ENABLE_NOTION_TOOLS and NOTION_TOOLS:
+        all_tools.extend(NOTION_TOOLS)
+    if ENABLE_MEMORY_SEARCH and MEMORY_TOOLS:
+        all_tools.extend(MEMORY_TOOLS)
+    use_tools = (tools_supported and len(all_tools) > 0)
+    logger.info(f"[Tools] decision: notion={ENABLE_NOTION_TOOLS}, "
+                f"memory={ENABLE_MEMORY_SEARCH}, "
                 f"model_supports={tools_supported}(model={model}), "
-                f"client_has_tools={client_has_tools} → use_tools={use_tools}")
+                f"total_tools={len(all_tools)} → use_tools={use_tools}")
     if use_tools:
         if client_has_tools:
-            extra["tools"] = extra["tools"] + NOTION_TOOLS
+            extra["tools"] = extra["tools"] + all_tools
         else:
-            extra["tools"] = NOTION_TOOLS
+            extra["tools"] = all_tools
         extra["tool_choice"] = "auto"
-        logger.info(f"[Tools] injected {len(NOTION_TOOLS)} Notion tools for {model}"
-                     f" (merged with client tools: {client_has_tools})")
+        logger.info(f"[Tools] injected {len(all_tools)} tools for {model} "
+                    f"(notion={len(NOTION_TOOLS) if ENABLE_NOTION_TOOLS else 0}, "
+                    f"memory={len(MEMORY_TOOLS) if ENABLE_MEMORY_SEARCH else 0})")
 
     # ---------- Tool call loop (non-streaming internally) ----------
     if use_tools:
@@ -1854,8 +1721,10 @@ def test_notion_tools():
         result["notion_token_prefix"] = token[:8] + "..." if token else "(empty)"
         result["notion_page_ids"] = config.NOTION_PAGE_IDS
         result["tools_enabled"] = ENABLE_NOTION_TOOLS
-        result["tools_count"] = len(NOTION_TOOLS)
-        result["tool_names"] = [t["function"]["name"] for t in NOTION_TOOLS]
+        result["memory_search_enabled"] = ENABLE_MEMORY_SEARCH
+        result["tools_count"] = len(NOTION_TOOLS) + len(MEMORY_TOOLS)
+        result["tool_names"] = ([t["function"]["name"] for t in NOTION_TOOLS]
+                                + [t["function"]["name"] for t in MEMORY_TOOLS])
 
         # Try a simple API call to verify token works
         if token:
