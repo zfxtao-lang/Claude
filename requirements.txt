@@ -3,3 +3,4 @@ gunicorn>=21.2
 requests>=2.31
 jieba>=0.42
 python-dotenv>=1.0
+caldav>=1.3

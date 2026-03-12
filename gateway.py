@@ -69,6 +69,14 @@ except ImportError as _e:
         import json
         return json.dumps({"error": "notion_tools not available"})
 try:
+    from calendar_tools import CALENDAR_TOOLS, execute_add_calendar_event
+except ImportError as _e:
+    logging.getLogger(__name__).error(f"Failed to import calendar_tools: {_e}")
+    CALENDAR_TOOLS = []
+    def execute_add_calendar_event(args):
+        import json
+        return json.dumps({"error": "calendar_tools not available"})
+try:
     from memory_tools import MEMORY_TOOLS, execute_search_memory
 except ImportError as _e:
     logging.getLogger(__name__).error(f"Failed to import memory_tools: {_e}")
@@ -155,6 +163,7 @@ VECTOR_EXCLUDE_HOURS = int(os.getenv("VECTOR_EXCLUDE_HOURS", "2"))
 # ---------- Function Calling (Notion Tools) ----------
 ENABLE_NOTION_TOOLS = os.getenv("ENABLE_NOTION_TOOLS", "true").lower() in ("true", "1", "yes")
 ENABLE_MEMORY_SEARCH = os.getenv("ENABLE_MEMORY_SEARCH", "true").lower() in ("true", "1", "yes")
+ENABLE_CALENDAR = os.getenv("ENABLE_CALENDAR", "true").lower() in ("true", "1", "yes")
 MAX_TOOL_ROUNDS = int(os.getenv("MAX_TOOL_ROUNDS", "3"))  # max tool call iterations per request
 
 # Models that support function calling (prefix match)
@@ -1289,6 +1298,8 @@ def _dispatch_tool_call(tool_name: str, arguments: dict) -> str:
         if not query:
             return "请提供搜索关键词。"
         return execute_search_memory(query)
+    elif tool_name == "add_calendar_event":
+        return execute_add_calendar_event(arguments)
     else:
         # Assume it's a Notion tool
         return execute_notion_tool(tool_name, arguments)
@@ -1539,9 +1550,12 @@ def chat_completions():
         all_tools.extend(NOTION_TOOLS)
     if ENABLE_MEMORY_SEARCH and MEMORY_TOOLS and reliable:
         all_tools.extend(MEMORY_TOOLS)
+    if ENABLE_CALENDAR and CALENDAR_TOOLS and reliable:
+        all_tools.extend(CALENDAR_TOOLS)
     use_tools = (tools_supported and len(all_tools) > 0)
     logger.info(f"[Tools] decision: notion={ENABLE_NOTION_TOOLS}, "
                 f"memory={ENABLE_MEMORY_SEARCH}(reliable={reliable}), "
+                f"calendar={ENABLE_CALENDAR}, "
                 f"model_supports={tools_supported}(model={model}), "
                 f"total_tools={len(all_tools)} → use_tools={use_tools}")
     if use_tools:
@@ -1552,7 +1566,8 @@ def chat_completions():
         extra["tool_choice"] = "auto"
         logger.info(f"[Tools] injected {len(all_tools)} tools for {model} "
                     f"(notion={len(NOTION_TOOLS) if ENABLE_NOTION_TOOLS else 0}, "
-                    f"memory={len(MEMORY_TOOLS) if ENABLE_MEMORY_SEARCH else 0})")
+                    f"memory={len(MEMORY_TOOLS) if ENABLE_MEMORY_SEARCH else 0}, "
+                    f"calendar={len(CALENDAR_TOOLS) if ENABLE_CALENDAR else 0})")
 
     # ---------- Tool call loop (non-streaming internally) ----------
     if use_tools:
