@@ -18,7 +18,7 @@ import caldav
 logger = logging.getLogger(__name__)
 
 # ---------- Config ----------
-CALDAV_URL = os.getenv("CALDAV_URL", "https://caldav.icloud.com")
+CALDAV_URL = os.getenv("CALDAV_URL", "https://caldav.icloud.com.cn")
 CALDAV_USERNAME = os.getenv("CALDAV_USERNAME", "")
 CALDAV_PASSWORD = os.getenv("CALDAV_PASSWORD", "")
 CALDAV_CALENDAR_NAME = os.getenv("CALDAV_CALENDAR", "小克提醒")
