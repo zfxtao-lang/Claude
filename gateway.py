@@ -180,6 +180,23 @@ def _model_supports_tools(model: str) -> bool:
     return any(m.startswith(p) for p in _TOOL_CAPABLE_PREFIXES)
 
 
+# Models that reliably follow tool calling instructions (won't skip or hallucinate)
+_RELIABLE_TOOL_PREFIXES = (
+    "anthropic/",    # Claude — strict, reliable
+    "claude",        # Claude direct
+    "deepseek-",     # DeepSeek — loves tools, reliable
+)
+
+
+def _model_reliable_tool_calling(model: str) -> bool:
+    """
+    Check if a model reliably uses search_memory tool when needed.
+    Unreliable models (GLM, Qwen, etc.) get auto-RAG fallback instead.
+    """
+    m = model.lower()
+    return any(m.startswith(p) for p in _RELIABLE_TOOL_PREFIXES)
+
+
 # ---------- Startup: confirm Notion tools status ----------
 logger.info(f"[Startup] ENABLE_NOTION_TOOLS={ENABLE_NOTION_TOOLS}, "
             f"ENABLE_MEMORY_SEARCH={ENABLE_MEMORY_SEARCH}, "
@@ -1121,8 +1138,33 @@ def build_messages(incoming_messages: list[dict], model: str) -> list[dict]:
         time_line = f"\n\n【当前时间】{now_str}"
         final_messages.append({"role": "system", "content": system_prompt + patch + time_line})
 
-    # --- Memory retrieval is now on-demand via search_memory tool ---
-    # No automatic RAG injection. The model calls search_memory when needed.
+    # --- Memory retrieval ---
+    # Reliable models (Claude, DeepSeek): use search_memory tool on-demand
+    # Unreliable models (GLM, Qwen, etc.): auto-inject RAG results as fallback
+    if not _model_reliable_tool_calling(model) and ENABLE_MEMORY_SEARCH:
+        raw_user_msg = extract_latest_user_message(cleaned)
+        if raw_user_msg:
+            _t_rag = time.time()
+            try:
+                memory_result = execute_search_memory(raw_user_msg)
+                if memory_result and memory_result != "没有找到相关的历史记忆。":
+                    final_messages.append({
+                        "role": "system",
+                        "content": (
+                            "【你和淘淘的相关记忆】\n"
+                            "以下是自动检索到的相关历史记忆，如果与当前话题相关就自然融入回答，"
+                            "不相关则忽略。不要说\"根据记录\"。\n\n"
+                            f"{memory_result}"
+                        ),
+                    })
+                    logger.info(f"[Memory] auto-RAG fallback for {model}: "
+                                f"injected {len(memory_result)} chars in {time.time()-_t_rag:.2f}s")
+                else:
+                    logger.info(f"[Memory] auto-RAG fallback: no results for '{raw_user_msg[:60]}'")
+            except Exception as e:
+                logger.warning(f"[Memory] auto-RAG fallback failed: {e}")
+    else:
+        logger.info(f"[Memory] using search_memory tool (reliable={_model_reliable_tool_calling(model)})")
 
     # --- 2. Today's conversation from Kelivo ---
     kelivo_msgs = [msg for msg in cleaned if msg["role"] != "system"]
@@ -1486,17 +1528,20 @@ def chat_completions():
         if key in data:
             extra[key] = data[key]
 
-    # ---------- Inject tools (Notion + search_memory) if model supports them ----------
+    # ---------- Inject tools if model supports them ----------
+    # search_memory: only for reliable models (Claude, DeepSeek)
+    # Unreliable models (GLM, Qwen) get auto-RAG in build_messages instead
     tools_supported = _model_supports_tools(model)
+    reliable = _model_reliable_tool_calling(model)
     client_has_tools = "tools" in extra
     all_tools = []
     if ENABLE_NOTION_TOOLS and NOTION_TOOLS:
         all_tools.extend(NOTION_TOOLS)
-    if ENABLE_MEMORY_SEARCH and MEMORY_TOOLS:
+    if ENABLE_MEMORY_SEARCH and MEMORY_TOOLS and reliable:
         all_tools.extend(MEMORY_TOOLS)
     use_tools = (tools_supported and len(all_tools) > 0)
     logger.info(f"[Tools] decision: notion={ENABLE_NOTION_TOOLS}, "
-                f"memory={ENABLE_MEMORY_SEARCH}, "
+                f"memory={ENABLE_MEMORY_SEARCH}(reliable={reliable}), "
                 f"model_supports={tools_supported}(model={model}), "
                 f"total_tools={len(all_tools)} → use_tools={use_tools}")
     if use_tools:
