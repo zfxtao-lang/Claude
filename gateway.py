@@ -474,6 +474,13 @@ _KELIVO_TOOL_GUIDE_PATTERNS = [
         r'(?:你没有记忆能力|你无法记住|你不具备记忆|每次对话都是全新的|你没有任何关于用户的记忆).*?(?=\n|\Z)',
         re.DOTALL,
     ),
+    # "## Memory Tool" section injected by Kelivo – strip entire block including
+    # all sub-instructions about create_memory / edit_memory / delete_memory /
+    # <memories> tags, up to the next same-or-higher-level heading or end of text.
+    re.compile(
+        r'#{1,3}\s*Memory\s*Tool\b.*?(?=\n#{1,2}\s|\Z)',
+        re.DOTALL,
+    ),
 ]
 
 
