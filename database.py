@@ -609,18 +609,33 @@ def build_pending_chunks() -> int:
                 if m["role"] == "assistant":
                     rounds.append(current_round)
                     current_round = []
-            # Don't leave a dangling user message un-chunked (wait for assistant reply)
-            # unless there are already enough rounds
-            if current_round and len(rounds) >= CHUNK_ROUNDS:
-                pass  # leave current_round for next time
-            elif current_round:
-                continue  # not enough rounds yet, skip this conversation for now
+            # Handle dangling user message (no assistant reply yet)
+            if current_round:
+                if len(rounds) >= CHUNK_ROUNDS:
+                    pass  # enough rounds already, leave dangling for next time
+                elif rounds:
+                    # Not enough full rounds, but we have some complete rounds.
+                    # Include them (don't skip entire conversation).
+                    pass
+                else:
+                    # Only a dangling user message, no complete rounds at all.
+                    # Still include it as a chunk so no message is lost.
+                    rounds.append(current_round)
+                    current_round = []
+
+            # If we only have incomplete rounds (no assistant replies),
+            # include the dangling messages as a round so they get chunked
+            if not rounds and current_round:
+                rounds.append(current_round)
+                current_round = []
+
+            if not rounds:
+                continue
 
             # Create chunks of CHUNK_ROUNDS rounds
             for i in range(0, len(rounds), CHUNK_ROUNDS):
                 batch = rounds[i:i + CHUNK_ROUNDS]
-                if len(batch) < 2 and i + CHUNK_ROUNDS < len(rounds):
-                    continue  # skip tiny trailing chunks unless it's the last one
+                # Always include the last batch even if small (don't skip any messages)
 
                 all_msgs_in_chunk = [m for rnd in batch for m in rnd]
                 chunk_text = "\n".join(
