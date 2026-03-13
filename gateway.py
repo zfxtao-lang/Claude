@@ -2053,16 +2053,25 @@ def vectors_rebuild():
 
             all_vecs = []
             all_ids = []
+            failed_batches = 0
             batch_size = 6
 
             for i in range(0, len(all_chunks), batch_size):
                 batch = all_chunks[i:i + batch_size]
                 texts = [c["content"] for c in batch]
                 vectors = get_embeddings_batch(texts)
+                batch_ok = 0
                 for chunk, vec in zip(batch, vectors):
                     if vec is not None:
                         all_vecs.append(vec)
                         all_ids.append(chunk["id"])
+                        batch_ok += 1
+                if batch_ok == 0:
+                    failed_batches += 1
+                # Progress log every 100 batches
+                if (i // batch_size) % 100 == 0:
+                    logger.info(f"[Vector] rebuild progress: {i+len(batch)}/{len(all_chunks)} chunks, "
+                                f"{len(all_vecs)} embedded, {failed_batches} failed batches")
                 # Rate limiting: ~10 calls/sec max
                 if i + batch_size < len(all_chunks):
                     time.sleep(0.2)
@@ -2072,9 +2081,12 @@ def vectors_rebuild():
                 id_array = _np.array(all_ids, dtype=_np.int64)
                 vector_store.rebuild(vec_array, id_array)
                 mark_chunks_embedded(all_ids)
-                logger.info(f"[Vector] rebuild complete: {len(all_vecs)} vectors")
+                logger.info(f"[Vector] rebuild complete: {len(all_vecs)} vectors "
+                            f"(from {len(all_chunks)} chunks, {failed_batches} failed batches)")
             else:
-                logger.warning("[Vector] rebuild: no vectors produced")
+                logger.warning("[Vector] rebuild: no vectors produced! "
+                               f"All {len(all_chunks)} chunks failed embedding. "
+                               "Check ALIBABA_API_KEY and embedding API connectivity.")
 
         except Exception:
             logger.error("[Vector] rebuild failed", exc_info=True)
