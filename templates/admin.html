@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>网关管理后台</title>
+  <link rel="stylesheet" href="/static/admin.css">
+</head>
+<body>
+  <div class="page">
+    <header class="hero">
+      <div>
+        <p class="eyebrow">可视化管理后台</p>
+        <h1>像点手机设置一样管理你的网关</h1>
+        <p class="hero-copy">
+          不用敲代码。按页面提示一步一步点，就能看状态、查记忆卡、重建总结、重建向量和做常见诊断。
+        </p>
+      </div>
+      <div class="hero-status">
+        <div class="status-chip" id="gatewayHealthChip">正在检查服务状态</div>
+        <div class="status-chip" id="jobStatusChip">任务状态：等待读取</div>
+      </div>
+    </header>
+
+    <section class="card setup-card">
+      <h2>第一步：填管理员口令</h2>
+      <p class="help-text">
+        这是后台专用口令。填好后点“保存口令”，下面所有按钮就能用了。
+      </p>
+      <div class="token-row">
+        <input id="tokenInput" type="password" placeholder="请输入管理员口令">
+        <button id="saveTokenBtn" class="primary-btn">保存口令</button>
+        <button id="clearTokenBtn" class="ghost-btn">清空口令</button>
+      </div>
+      <p class="subtle-text">口令只会保存在当前浏览器里，不会显示给别人看。</p>
+    </section>
+
+    <nav class="tab-bar" aria-label="后台模块">
+      <button class="tab-btn active" data-target="overviewPanel">首页总览</button>
+      <button class="tab-btn" data-target="memoryPanel">记忆卡管理</button>
+      <button class="tab-btn" data-target="vectorPanel">向量与诊断</button>
+    </nav>
+
+    <main class="panel-stack">
+      <section class="panel active" id="overviewPanel">
+        <div class="section-title">
+          <h2>首页总览</h2>
+          <button id="refreshOverviewBtn" class="ghost-btn">刷新首页</button>
+        </div>
+        <div id="overviewCards" class="metric-grid"></div>
+        <div class="two-col">
+          <section class="card">
+            <div class="section-title">
+              <h3>当前模型与提供商</h3>
+              <button id="reloadProvidersBtn" class="ghost-btn">重新加载模型配置</button>
+            </div>
+            <div id="providerSummary" class="list-block empty-state">还没有读取到数据。</div>
+          </section>
+          <section class="card">
+            <div class="section-title">
+              <h3>任务中心</h3>
+              <button id="refreshJobsBtn" class="ghost-btn">刷新任务状态</button>
+            </div>
+            <div id="jobSummary" class="list-block empty-state">还没有读取到数据。</div>
+          </section>
+        </div>
+      </section>
+
+      <section class="panel" id="memoryPanel">
+        <div class="section-title">
+          <h2>记忆卡管理</h2>
+          <button id="refreshCardsBtn" class="ghost-btn">刷新记忆卡</button>
+        </div>
+
+        <div class="two-col">
+          <section class="card">
+            <h3>常用操作</h3>
+            <p class="help-text">不知道怎么选时，先用“查看最近记忆卡”和“生成某一天总结”。</p>
+            <div class="form-grid">
+              <label>
+                <span>单独生成哪一天</span>
+                <input id="generateDateInput" type="date">
+              </label>
+              <label>
+                <span>开始日期</span>
+                <input id="rangeStartInput" type="date">
+              </label>
+              <label>
+                <span>结束日期</span>
+                <input id="rangeEndInput" type="date">
+              </label>
+              <label class="checkbox-row">
+                <input id="forceGenerateInput" type="checkbox">
+                <span>强制重做已有总结</span>
+              </label>
+            </div>
+            <div class="action-row">
+              <button id="generateSingleBtn" class="primary-btn">生成这一天总结</button>
+              <button id="generateRangeBtn" class="ghost-btn">生成一段时间总结</button>
+              <button id="embedCardsBtn" class="ghost-btn">补做记忆卡向量</button>
+            </div>
+            <div class="danger-box">
+              <p>危险操作：会重做一大批历史总结，时间会比较久。</p>
+              <button id="rebuildCardsBtn" class="danger-btn">全量重建记忆卡</button>
+            </div>
+          </section>
+
+          <section class="card">
+            <h3>搜索和查看</h3>
+            <div class="form-grid">
+              <label>
+                <span>按日期查看</span>
+                <input id="filterDateInput" type="date">
+              </label>
+              <label>
+                <span>关键词搜索</span>
+                <input id="cardSearchInput" type="text" placeholder="例如：焦虑、工作、Notion">
+              </label>
+            </div>
+            <div class="action-row">
+              <button id="loadCardListBtn" class="primary-btn">查看最近记忆卡</button>
+              <button id="searchCardsBtn" class="ghost-btn">搜索记忆卡</button>
+            </div>
+            <div id="cardStatusSummary" class="mini-summary empty-state">还没有读取到数据。</div>
+          </section>
+        </div>
+
+        <section class="card">
+          <div class="section-title">
+            <h3>记忆卡列表</h3>
+            <div class="page-controls">
+              <button id="cardsPrevBtn" class="ghost-btn">上一页</button>
+              <span id="cardsPageText">第 1 页</span>
+              <button id="cardsNextBtn" class="ghost-btn">下一页</button>
+            </div>
+          </div>
+          <div id="cardList" class="card-list empty-state">还没有读取到数据。</div>
+        </section>
+
+        <section class="card">
+          <h3>搜索结果</h3>
+          <div id="cardSearchResults" class="card-list empty-state">还没有搜索。</div>
+        </section>
+      </section>
+
+      <section class="panel" id="vectorPanel">
+        <div class="section-title">
+          <h2>向量与诊断</h2>
+          <button id="refreshVectorsBtn" class="ghost-btn">刷新本页</button>
+        </div>
+
+        <div class="two-col">
+          <section class="card">
+            <h3>向量操作</h3>
+            <p class="help-text">向量像“检索索引”。如果记忆搜索不准，通常先看这里。</p>
+            <div class="action-row">
+              <button id="nightlyVectorBtn" class="primary-btn">执行一次日常补量</button>
+              <button id="fullVectorRebuildBtn" class="danger-btn">全量重建向量</button>
+            </div>
+            <div id="vectorStatusSummary" class="mini-summary empty-state">还没有读取到数据。</div>
+          </section>
+
+          <section class="card">
+            <h3>工具诊断</h3>
+            <div class="action-row">
+              <button id="refreshNotionBtn" class="ghost-btn">刷新 Notion 缓存</button>
+              <button id="testNotionBtn" class="ghost-btn">检查 Notion 连通性</button>
+              <button id="backupBtn" class="ghost-btn">立即备份数据库</button>
+            </div>
+            <div id="diagnosticSummary" class="mini-summary empty-state">还没有读取到数据。</div>
+          </section>
+        </div>
+
+        <section class="card">
+          <h3>详细结果</h3>
+          <pre id="diagnosticOutput" class="log-box">还没有执行操作。</pre>
+        </section>
+      </section>
+    </main>
+
+    <section class="toast-area">
+      <div id="flashMessage" class="flash hidden"></div>
+    </section>
+  </div>
+
+  <script src="/static/admin.js"></script>
+</body>
+</html>

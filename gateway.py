@@ -14,6 +14,7 @@ Fixes applied:
   10. Rate limiting
 """
 import json
+import ipaddress
 import logging
 import os
 import re
@@ -27,7 +28,7 @@ from functools import wraps
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry as Urllib3Retry
-from flask import Flask, Response, jsonify, request, stream_with_context
+from flask import Flask, Response, jsonify, render_template, request, stream_with_context
 
 import config
 from config import (
@@ -47,7 +48,7 @@ from config import (
 )
 from database import (
     backup_database, build_pending_chunks, get_chunks_by_ids, get_neighbor_chunks,
-    get_recent_cards, get_recent_cross_window_messages,
+    get_recent_cards,
     get_unembedded_chunks, init_db, mark_chunks_embedded, save_message,
     search_history, start_writer,
 )
@@ -56,7 +57,8 @@ from embedding import (
     vector_store, card_vector_store,
 )
 from memory_cards import (
-    embed_pending_cards, generate_card_for_date, generate_cards_batch,
+    derive_weekly_digests_from_cards,
+    embed_pending_cards, full_regenerate_memory_cards, generate_card_for_date, generate_cards_batch,
     search_memory_cards,
 )
 from notion_cache import get_notion_content, invalidate_cache
@@ -84,6 +86,12 @@ except ImportError as _e:
     def execute_search_memory(query):
         return "记忆搜索功能暂时不可用。"
 
+try:
+    from lutopia_tools import LUTOPIA_TOOLS, execute_register_lutopia_agent, execute_publish_lutopia_post, execute_read_lutopia_posts, execute_read_post_detail, execute_reply_lutopia_post
+except ImportError as _e:
+    logging.getLogger(__name__).error(f"Failed to import lutopia_tools: {_e}")
+    LUTOPIA_TOOLS = []
+
 # ---------- App Setup ----------
 app = Flask(__name__)
 logging.basicConfig(
@@ -91,6 +99,58 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+_card_rebuild_state_lock = threading.Lock()
+_card_rebuild_state = {
+    "running": False,
+    "phase": "idle",
+    "message": "",
+    "started_at": None,
+    "completed_at": None,
+    "error": None,
+    "result": None,
+}
+
+_vector_rebuild_state_lock = threading.Lock()
+_vector_rebuild_state = {
+    "running": False,
+    "phase": "idle",
+    "message": "",
+    "started_at": None,
+    "completed_at": None,
+    "error": None,
+    "result": None,
+}
+
+
+def _set_card_rebuild_state(**updates):
+    with _card_rebuild_state_lock:
+        _card_rebuild_state.update(updates)
+
+
+def _get_card_rebuild_state() -> dict:
+    with _card_rebuild_state_lock:
+        return dict(_card_rebuild_state)
+
+
+def _card_rebuild_running() -> bool:
+    with _card_rebuild_state_lock:
+        return bool(_card_rebuild_state.get("running"))
+
+
+def _set_vector_rebuild_state(**updates):
+    with _vector_rebuild_state_lock:
+        _vector_rebuild_state.update(updates)
+
+
+def _get_vector_rebuild_state() -> dict:
+    with _vector_rebuild_state_lock:
+        return dict(_vector_rebuild_state)
+
+
+def _vector_rebuild_running() -> bool:
+    with _vector_rebuild_state_lock:
+        return bool(_vector_rebuild_state.get("running"))
 
 # ---------- Persistent HTTP Session with connection pooling ----------
 _http_session = requests.Session()
@@ -151,9 +211,13 @@ def _do_nightly_vectorize():
         return 0
 
 
-# ---------- Recent Context (cross-window awareness) ----------
-RECENT_CARD_DAYS = int(os.getenv("RECENT_CARD_DAYS", "2"))       # auto-inject cards from last N days
-RECENT_MSG_ROUNDS = int(os.getenv("RECENT_MSG_ROUNDS", "5"))     # today's cross-window messages (pairs)
+# ---------- Context Windows ----------
+RECENT_RAW_MAX_MESSAGES = int(os.getenv("RECENT_RAW_MAX_MESSAGES", "20"))
+ROLLING_SUMMARY_DAYS = int(os.getenv("ROLLING_SUMMARY_DAYS", "14"))
+ROLLING_SUMMARY_LIMIT = int(os.getenv("ROLLING_SUMMARY_LIMIT", "10"))
+ROLLING_SUMMARY_MAX_CHARS = int(os.getenv("ROLLING_SUMMARY_MAX_CHARS", "2500"))
+ROLLING_DAILY_CARD_LIMIT = int(os.getenv("ROLLING_DAILY_CARD_LIMIT", "5"))
+ROLLING_WEEKLY_DIGEST_LIMIT = int(os.getenv("ROLLING_WEEKLY_DIGEST_LIMIT", "2"))
 
 # ---------- Vector Search ----------
 VECTOR_MIN_SCORE = float(os.getenv("VECTOR_MIN_SCORE", "0.2"))
@@ -311,21 +375,61 @@ def _days_ago(date_str: str) -> str:
         return ""
 
 
-def build_recent_context(model: str) -> str | None:
+def _normalize_overlap_text(text: str) -> str:
+    return re.sub(r"\s+", "", text or "").lower()
+
+
+def _has_recent_overlap(recent_ctx: str | None, memory_result: str | None) -> bool:
     """
-    Build recent context block for cross-window awareness.
-    Includes:
-      1. Recent memory cards (last N days) — what happened recently
-      2. Today's cross-window messages — what was discussed today in other windows
-    Returns formatted string or None if nothing to inject.
+    Skip auto-RAG when the same facts are already present in rolling summaries.
+    This keeps prompt growth under control for weaker tool-calling models.
+    """
+    if not recent_ctx or not memory_result:
+        return False
+    normalized_recent = _normalize_overlap_text(recent_ctx)
+    hits = 0
+    for line in str(memory_result).splitlines():
+        normalized_line = _normalize_overlap_text(line)
+        if len(normalized_line) < 16:
+            continue
+        if normalized_line in normalized_recent:
+            hits += 1
+        if hits >= 2:
+            return True
+    return False
+
+
+def _limit_recent_messages(messages: list[dict], max_messages: int) -> list[dict]:
+    """Keep only the newest N user/assistant messages before token trimming."""
+    if max_messages <= 0 or len(messages) <= max_messages:
+        return list(messages)
+    return list(messages[-max_messages:])
+
+
+def build_recent_context(model: str, exclude_conversation_id: str | None = None) -> str | None:
+    """
+    Build the rolling-summary layer for the prompt.
+    Summary source is unified to the new memory-card pipeline:
+    recent daily cards + weekly digests derived from those cards.
+    Legacy daily_summary / weekly_summary tables are intentionally not read here.
     """
     lines = []
     family = _model_family(model)
 
-    # --- Part 1: Recent memory cards (last N days, unconditional) ---
-    recent_cards = get_recent_cards(days=RECENT_CARD_DAYS)
+    recent_cards = get_recent_cards(days=ROLLING_SUMMARY_DAYS)
     if recent_cards:
+        seen_dates = set()
+        daily_cards = []
         for card in recent_cards:
+            date = card.get("date", "?")
+            if date in seen_dates:
+                continue
+            seen_dates.add(date)
+            daily_cards.append(card)
+            if len(daily_cards) >= ROLLING_DAILY_CARD_LIMIT:
+                break
+
+        for card in daily_cards:
             date = card.get("date", "?")
             summary = card.get("summary", "")
             tags = card.get("tags", "")
@@ -333,48 +437,46 @@ def build_recent_context(model: str) -> str | None:
             tag_str = f" #{tags}" if tags else ""
             lines.append(f"[{date} ({ago}){tag_str}]\n{summary}")
 
-    # --- Part 2: Today's cross-window messages ---
-    # Fetch last N messages from today (across all windows)
-    recent_msgs = get_recent_cross_window_messages(limit=RECENT_MSG_ROUNDS * 2)
-    if recent_msgs:
-        today_lines = []
-        for msg in recent_msgs:
-            role = msg.get("role", "")
-            content = (msg.get("content") or "").strip()
-            if not content or len(content) < 2:
-                continue
-            # Truncate long messages
-            if len(content) > 150:
-                content = content[:150] + "..."
-            label = "淘淘" if role == "user" else "小克"
-            today_lines.append(f"{label}: {content}")
-        if today_lines:
-            lines.append(f"[今天的近期对话]\n" + "\n".join(today_lines))
+        if len(lines) < ROLLING_SUMMARY_LIMIT:
+            older_cards = []
+            daily_dates = {c.get("date", "") for c in daily_cards}
+            for card in recent_cards:
+                if card.get("date", "") in daily_dates:
+                    continue
+                older_cards.append(card)
+            weekly_digests = derive_weekly_digests_from_cards(
+                older_cards,
+                max_weeks=ROLLING_WEEKLY_DIGEST_LIMIT,
+            )
+            for digest in reversed(weekly_digests):
+                lines.append(digest["summary"])
+                if len(lines) >= ROLLING_SUMMARY_LIMIT:
+                    break
 
     if not lines:
         return None
 
     content = "\n\n".join(lines)
-    # Cap total recent context to avoid inflating DeepSeek thinking time
-    if len(content) > 3000:
-        content = content[:3000] + "\n...(truncated)"
+    if len(content) > ROLLING_SUMMARY_MAX_CHARS:
+        content = content[:ROLLING_SUMMARY_MAX_CHARS] + "\n...(truncated)"
 
     if family == "claude":
         return (
             "<recent_context>\n"
             "<instructions>\n"
-            "Below is a timeline of what happened recently between you and 淘淘. "
-            "This gives you awareness of recent conversations even across different chat windows. "
-            "Use this naturally — you know what happened recently.\n"
+            "Below are rolling summaries of recent conversations between you and 淘淘. "
+            "Treat them as compact memory state, not as raw chat transcript. "
+            "Retain concrete details such as names, UIDs, promises, events and emotional changes. "
+            "Use them naturally when relevant.\n"
             "</instructions>\n"
             f"{content}\n"
             "</recent_context>"
         )
     else:
         return (
-            "【最近的对话时间线】\n"
-            "以下是你和淘淘最近几天的对话摘要和今天的近期聊天。\n"
-            "即使换了新窗口，你也知道最近发生了什么。自然地使用这些信息。\n\n"
+            "【最近的滚动摘要】\n"
+            "以下是你和淘淘最近一段时间的高密度摘要，不是原始聊天记录。\n"
+            "重要指令：这里面包含具体事件、数字细节、约定承诺和情绪变化，请自然地记住并在相关时使用。\n\n"
             f"{content}"
         )
 
@@ -401,12 +503,46 @@ def _check_rate_limit(key: str = "global") -> tuple[bool, str]:
     return True, ""
 
 
+def _parse_ip(value: str | None):
+    if not value:
+        return None
+    try:
+        return ipaddress.ip_address(value.strip())
+    except ValueError:
+        return None
+
+
+def _remote_ip_obj():
+    return _parse_ip(request.remote_addr)
+
+
+def _is_local_request() -> bool:
+    remote_ip = _remote_ip_obj()
+    return bool(remote_ip and remote_ip.is_loopback)
+
+
+def _get_rate_limit_key() -> str:
+    """
+    Only trust X-Forwarded-For when the direct peer is local/private.
+    Direct公网 clients should not be able to spoof their rate-limit identity.
+    """
+    remote_ip = _remote_ip_obj()
+    forwarded_for = request.headers.get("X-Forwarded-For", "")
+    if remote_ip and (remote_ip.is_loopback or remote_ip.is_private) and forwarded_for:
+        client_ip = forwarded_for.split(",")[0].strip()
+        return client_ip or str(remote_ip)
+    return str(remote_ip) if remote_ip else "unknown"
+
+
 # ---------- Auth Middleware ----------
 def require_auth(f):
     @wraps(f)
     def decorated(*args, **kwargs):
         if not GATEWAY_AUTH_TOKEN:
-            return f(*args, **kwargs)
+            if _is_local_request():
+                return f(*args, **kwargs)
+            logger.warning("[Auth] protected endpoint blocked because GATEWAY_AUTH_TOKEN is unset")
+            return jsonify({"error": "Gateway auth token is not configured"}), 503
         auth = request.headers.get("Authorization", "")
         token = auth.replace("Bearer ", "") if auth.startswith("Bearer ") else ""
         if token != GATEWAY_AUTH_TOKEN:
@@ -430,22 +566,18 @@ def add_cors_headers(response):
 @app.route("/health", methods=["GET"])
 def health():
     """Health check endpoint for monitoring."""
-    provider_status = {}
-    for name, cfg in config.PROVIDERS.items():
-        provider_status[name] = {
-            "configured": bool(cfg.get("api_key")),
-            "prefixes": cfg.get("prefixes", []),
-        }
     return jsonify({
         "status": "ok",
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "providers": provider_status,
-        "notion_tools": {
-            "enabled": ENABLE_NOTION_TOOLS,
-            "tools_loaded": len(NOTION_TOOLS),
-            "tool_names": [t["function"]["name"] for t in NOTION_TOOLS] if NOTION_TOOLS else [],
-        },
+        "auth_configured": bool(GATEWAY_AUTH_TOKEN),
     })
+
+
+@app.route("/admin", methods=["GET"])
+@app.route("/admin/ui", methods=["GET"])
+def admin_ui():
+    """Serve the visual admin console shell."""
+    return render_template("admin.html")
 
 
 # ---------- Message Filtering (Kelivo cleanup) ----------
@@ -501,9 +633,18 @@ def filter_kelivo_messages(messages: list[dict]) -> list[dict]:
     - Strip "你是一个无状态的大模型..." tool guides from message content
     - Remove empty content messages
     - Skip duplicate system prompts (keep only our own)
+    - NEW: Strip historical tool-calling garbage to save context slots.
     """
     filtered = []
-    for msg in messages:
+    
+    # --- FIX: 清理隐形消息，只保留最后一轮（即当前轮次）的工具调用，前面的全删 ---
+    # 先找到最后一个工具相关的消息索引
+    last_tool_idx = -1
+    for i, msg in enumerate(messages):
+        if msg.get("role") == "tool" or msg.get("tool_calls") or msg.get("tool_call_id"):
+            last_tool_idx = i
+
+    for i, msg in enumerate(messages):
         role = msg.get("role", "")
         content = msg.get("content", "")
 
@@ -516,7 +657,6 @@ def filter_kelivo_messages(messages: list[dict]) -> list[dict]:
                     cleaned_text = _strip_kelivo_tool_guide(part["text"])
                     if cleaned_text:
                         new_parts.append({**part, "text": cleaned_text})
-                    # drop empty text parts
                 else:
                     new_parts.append(part)
             if new_parts:
@@ -525,10 +665,15 @@ def filter_kelivo_messages(messages: list[dict]) -> list[dict]:
 
         content_str = str(content).strip() if content else ""
 
-        # Preserve tool-related messages as-is (function calling flow)
+        # --- FIX: 智能保留/丢弃工具消息 ---
         if role == "tool" or msg.get("tool_calls") or msg.get("tool_call_id"):
-            filtered.append(msg)
-            continue
+            # 如果是过去历史中的工具废话，直接扔掉！把 50 条名额还给纯聊天
+            if i < last_tool_idx - 2: # 留一点冗余给正在执行的工具链
+                logger.info("Filtered out historical tool garbage to save slots.")
+                continue
+            else:
+                filtered.append(msg)
+                continue
 
         # Skip empty messages
         if not content_str:
@@ -542,15 +687,15 @@ def filter_kelivo_messages(messages: list[dict]) -> list[dict]:
             logger.info("Filtered out Kelivo Memory Tool message")
             continue
 
-        # Strip tool-guide preamble from content
+        # Strip tool-guide preamble from content (这里就是你的正则清洗，完美保留)
         cleaned_content = _strip_kelivo_tool_guide(content_str)
         if not cleaned_content:
             logger.info(f"Filtered out Kelivo tool-guide-only {role} message")
             continue
 
         filtered.append({**msg, "content": cleaned_content})
+        
     return filtered
-
 
 def extract_latest_user_message(messages: list[dict]) -> str:
     """Get the last user message content (text only)."""
@@ -1105,12 +1250,13 @@ def _trim_messages_to_fit(messages: list[dict], max_chars: int) -> list[dict]:
 
 
 # ---------- Build Messages ----------
-def build_messages(incoming_messages: list[dict], model: str) -> list[dict]:
+def build_messages(incoming_messages: list[dict], model: str,
+                   conversation_id: str | None = None) -> list[dict]:
     """
-    Build the final message list (v5.0 Lite):
-    - system(persona + recent_summary + model patch + time) → Kelivo messages
-    - Memory retrieval is on-demand via search_memory tool (no auto-RAG)
-    - Notion injection removed (tools still available via function calling)
+    Build the final message list using a three-layer context model:
+    1. System prompt + rolling summaries + current time
+    2. Recent raw conversation window from the current chat
+    3. Long-term memory retrieval on demand (or auto-RAG for weak tool callers)
     """
     _t_build_start = time.time()
     system_prompt = load_system_prompt()
@@ -1122,24 +1268,18 @@ def build_messages(incoming_messages: list[dict], model: str) -> list[dict]:
     recent_ctx = None
     _t_parallel = time.time()
     try:
-        recent_ctx = build_recent_context(model)
+        recent_ctx = build_recent_context(model, exclude_conversation_id=conversation_id)
     except Exception as e:
         logger.warning(f"[Perf] recent_ctx fetch failed: {e}")
 
     logger.info(f"[Perf] context fetch: {time.time()-_t_parallel:.2f}s "
                 f"(recent_ctx={'yes' if recent_ctx else 'no'})")
 
-    # Message structure (v5.0 Lite):
-    #   1. system(persona + {{RECENT_SUMMARY}} filled + model patch + time)
-    #   2. Kelivo user/assistant messages (today's conversation)
-    #   Memory retrieval is now on-demand via search_memory tool.
     final_messages = []
 
     # --- 1. Persona + recent summary + model-specific patch + current time ---
     if system_prompt:
-        # Fill {{RECENT_SUMMARY}} placeholder with recent context
         if recent_ctx and "{{RECENT_SUMMARY}}" in system_prompt:
-            # Strip model-specific wrapper, just use the content
             summary_text = recent_ctx
             system_prompt = system_prompt.replace("{{RECENT_SUMMARY}}", summary_text)
             logger.info(f"[RecentSummary] filled {{RECENT_SUMMARY}} ({len(summary_text)} chars)")
@@ -1155,47 +1295,45 @@ def build_messages(incoming_messages: list[dict], model: str) -> list[dict]:
         final_messages.append({"role": "system", "content": system_prompt + patch + time_line})
 
     # --- Memory retrieval ---
-    # Reliable models (Claude, DeepSeek): use search_memory tool on-demand
-    # Unreliable models (GLM, Qwen, etc.): auto-inject RAG results as fallback
     if not _model_reliable_tool_calling(model) and ENABLE_MEMORY_SEARCH:
-        raw_user_msg = extract_latest_user_message(cleaned)
-        if raw_user_msg:
+        search_query = extract_search_query(cleaned)
+        if search_query:
             _t_rag = time.time()
             try:
-                memory_result = execute_search_memory(raw_user_msg)
+                memory_result = execute_search_memory(search_query)
                 if memory_result and memory_result != "没有找到相关的历史记忆。":
-                    final_messages.append({
-                        "role": "system",
-                        "content": (
-                            "【你和淘淘的相关记忆】\n"
-                            "以下是自动检索到的相关历史记忆，如果与当前话题相关就自然融入回答，"
-                            "不相关则忽略。不要说\"根据记录\"。\n\n"
-                            f"{memory_result}"
-                        ),
-                    })
-                    logger.info(f"[Memory] auto-RAG fallback for {model}: "
-                                f"injected {len(memory_result)} chars in {time.time()-_t_rag:.2f}s")
+                    if _has_recent_overlap(recent_ctx, memory_result):
+                        logger.info("[Memory] auto-RAG skipped because rolling summaries already cover the result")
+                    else:
+                        final_messages.append({
+                            "role": "system",
+                            "content": (
+                                "【你和淘淘的相关记忆】\n"
+                                "以下是自动检索到的相关历史记忆，如果与当前话题相关就自然融入回答，"
+                                "不相关则忽略。不要说\"根据记录\"。\n\n"
+                                f"{memory_result}"
+                            ),
+                        })
+                        logger.info(f"[Memory] auto-RAG fallback for {model}: "
+                                    f"injected {len(memory_result)} chars in {time.time()-_t_rag:.2f}s")
                 else:
-                    logger.info(f"[Memory] auto-RAG fallback: no results for '{raw_user_msg[:60]}'")
+                    logger.info(f"[Memory] auto-RAG fallback: no results for '{search_query[:60]}'")
             except Exception as e:
                 logger.warning(f"[Memory] auto-RAG fallback failed: {e}")
     else:
         logger.info(f"[Memory] using search_memory tool (reliable={_model_reliable_tool_calling(model)})")
 
-    # --- 2. Today's conversation from Kelivo ---
+    # --- 2. Recent raw conversation window from current chat ---
     kelivo_msgs = [msg for msg in cleaned if msg["role"] != "system"]
+    kelivo_msgs = _limit_recent_messages(kelivo_msgs, RECENT_RAW_MAX_MESSAGES)
 
-    # --- Context window management ---
-    # Estimate tokens for system/memory prefix messages (keep all of them)
     prefix_chars = sum(_estimate_msg_chars(m) for m in final_messages)
     max_context = _model_max_context(model)
-    # Reserve tokens: prefix + reply headroom (4096 tokens)
     reply_reserve = 4096
     available_chars = int((max_context - reply_reserve) * _CHARS_PER_TOKEN) - prefix_chars
     if available_chars < 2000:
         available_chars = 2000  # absolute minimum
 
-    # Trim Kelivo messages from the OLD end, keep recent conversation
     trimmed_kelivo = _trim_messages_to_fit(kelivo_msgs, available_chars)
     if len(trimmed_kelivo) < len(kelivo_msgs):
         logger.info(f"[Context] Trimmed Kelivo messages from {len(kelivo_msgs)} "
@@ -1263,8 +1401,7 @@ def _call_with_retry(provider_cfg, messages, model, stream, extra):
 
             if resp.status_code != 200:
                 error_body = resp.text
-                logger.error(f"API error {resp.status_code} (attempt {attempt + 1}): "
-                             f"{error_body[:300]}")
+                logger.error(f"API error {resp.status_code} (attempt {attempt + 1})")
                 if (resp.status_code >= 500 or resp.status_code == 429) \
                         and attempt < API_MAX_RETRIES:
                     retry_after = resp.headers.get("Retry-After")
@@ -1307,6 +1444,34 @@ def _dispatch_tool_call(tool_name: str, arguments: dict) -> str:
         return execute_search_memory(query)
     elif tool_name == "add_calendar_event":
         return execute_add_calendar_event(arguments)
+    elif tool_name == "register_lutopia_agent":
+        return execute_register_lutopia_agent(
+            name=arguments.get("name", ""),
+            uid=arguments.get("uid", "")
+        )
+    elif tool_name == "publish_lutopia_post":
+        return execute_publish_lutopia_post(
+            uid=arguments.get("uid", ""),
+            submolt=arguments.get("submolt", "general"),
+            title=arguments.get("title", ""),
+            content=arguments.get("content", "")
+        )
+    elif tool_name == "read_lutopia_posts":
+        return execute_read_lutopia_posts(
+            uid=arguments.get("uid", ""),
+            submolt=arguments.get("submolt", "general"),
+            sort=arguments.get("sort", "new"),
+            limit=arguments.get("limit", 5)
+        )
+    elif tool_name == "read_post_detail":
+        return execute_read_post_detail(
+            post_id=arguments.get("post_id", "")
+        )
+    elif tool_name == "reply_lutopia_post":
+        return execute_reply_lutopia_post(
+            post_id=arguments.get("post_id", ""),
+            content=arguments.get("content", "")
+        )
     else:
         # Assume it's a Notion tool
         return execute_notion_tool(tool_name, arguments)
@@ -1460,8 +1625,7 @@ def chat_completions():
         return "", 204
 
     # Rate limit (per-IP)
-    client_ip = request.headers.get("X-Forwarded-For", request.remote_addr) or "unknown"
-    client_ip = client_ip.split(",")[0].strip()  # first IP if behind proxy
+    client_ip = _get_rate_limit_key()
     allowed, err_msg = _check_rate_limit(client_ip)
     if not allowed:
         return jsonify({"error": {"message": err_msg, "type": "rate_limit_error"}}), 429
@@ -1471,6 +1635,7 @@ def chat_completions():
     model = data.get("model", "gpt-4o")
     stream = data.get("stream", False)
     incoming_messages = data.get("messages", [])
+    conversation_id = data.get("conversation_id", str(uuid.uuid4()))
 
     logger.info(f"Request: model={model}, stream={stream}, "
                 f"messages_count={len(incoming_messages)}")
@@ -1485,23 +1650,10 @@ def chat_completions():
                 if ptype == "text":
                     parts_summary.append(f"text({len(p.get('text', ''))}chars)")
                 elif ptype == "image_url":
-                    url = p.get("image_url", {}).get("url", "")
-                    parts_summary.append(f"image({url[:30]}...)" if len(url) > 30 else f"image({url})")
+                    parts_summary.append("image_url")
                 else:
                     parts_summary.append(ptype)
             logger.info(f"[Multimodal] msg[{i}] role={msg.get('role')} parts: {parts_summary}")
-
-    # Debug: log last user message content (to see OCR tags from Kelivo)
-    for msg in reversed(incoming_messages):
-        if msg.get("role") == "user":
-            _content = msg.get("content", "")
-            if isinstance(_content, list):
-                _text_parts = [p.get("text", "") for p in _content if p.get("type") == "text"]
-                _preview = " | ".join(_text_parts)[:500]
-            else:
-                _preview = str(_content)[:500]
-            logger.info(f"[Debug] last user msg: {_preview}")
-            break
 
     # Intercept Kelivo internal summary requests - don't waste API calls
     if _is_kelivo_summary_request(incoming_messages):
@@ -1527,12 +1679,11 @@ def chat_completions():
 
     provider_name = provider_cfg["provider"]
     _t0_build = time.time()
-    messages = build_messages(incoming_messages, model)
+    messages = build_messages(incoming_messages, model, conversation_id=conversation_id)
     logger.info(f"[Perf] build_messages took {time.time() - _t0_build:.2f}s")
 
     # Extract user message for storage
     user_text = extract_latest_user_message(incoming_messages)
-    conversation_id = data.get("conversation_id", str(uuid.uuid4()))
 
     # Save user message (only the latest, not Kelivo history)
     if user_text:
@@ -1557,6 +1708,8 @@ def chat_completions():
         all_tools.extend(NOTION_TOOLS)
     if ENABLE_MEMORY_SEARCH and MEMORY_TOOLS and reliable:
         all_tools.extend(MEMORY_TOOLS)
+    if LUTOPIA_TOOLS:
+        all_tools.extend(LUTOPIA_TOOLS)
     if ENABLE_CALENDAR and CALENDAR_TOOLS and reliable:
         all_tools.extend(CALENDAR_TOOLS)
     use_tools = (tools_supported and len(all_tools) > 0)
@@ -1598,8 +1751,7 @@ def chat_completions():
             save_message(conversation_id, "assistant", clean_content,
                          model, provider_name, tokens_in, tokens_out)
         else:
-            logger.warning(f"Empty assistant response after tool loop. "
-                           f"Raw: {json.dumps(result_json)[:500]}")
+            logger.warning("Empty assistant response after tool loop")
 
         # Deliver response: fake-stream if client wanted streaming
         if stream:
@@ -1627,7 +1779,7 @@ def chat_completions():
 
                 if needs_monologue_strip:
                     # Claude models may output <inner_monologue> — buffer full
-                    # response, strip, then re-emit (slower but necessary)
+                    # response, strip, then re-emit clean content only
                     last_chunk_data = None
                     for line in resp.iter_lines(decode_unicode=True):
                         if not line:
@@ -1646,9 +1798,10 @@ def chat_completions():
                     if full_text.strip():
                         clean_text = _strip_inner_monologue(full_text)
                         save_message(conversation_id, "assistant", clean_text,
-                                    model, provider_name)
+                                     model, provider_name)
                         chunk_id = last_chunk_data.get("id", "") if last_chunk_data else ""
                         chunk_model = last_chunk_data.get("model", model) if last_chunk_data else model
+
                         for char in clean_text:
                             chunk = {
                                 "id": chunk_id,
@@ -1657,6 +1810,7 @@ def chat_completions():
                                 "choices": [{"index": 0, "delta": {"content": char}, "finish_reason": None}],
                             }
                             yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
                         yield f"data: {json.dumps({'id': chunk_id, 'object': 'chat.completion.chunk', 'model': chunk_model, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
                         yield "data: [DONE]\n\n"
                     else:
@@ -1722,7 +1876,7 @@ def chat_completions():
         save_message(conversation_id, "assistant", clean_content,
                      model, provider_name, tokens_in, tokens_out)
     else:
-        logger.warning(f"Empty assistant response. Raw: {json.dumps(raw_json)[:500]}")
+        logger.warning("Empty assistant response")
 
     return jsonify(result)
 
@@ -1785,8 +1939,6 @@ def test_notion_tools():
         # Basic connectivity check
         token = config.NOTION_TOKEN
         result["notion_token_set"] = bool(token)
-        result["notion_token_prefix"] = token[:8] + "..." if token else "(empty)"
-        result["notion_page_ids"] = config.NOTION_PAGE_IDS
         result["tools_enabled"] = ENABLE_NOTION_TOOLS
         result["memory_search_enabled"] = ENABLE_MEMORY_SEARCH
         result["tools_count"] = len(NOTION_TOOLS) + len(MEMORY_TOOLS)
@@ -1907,6 +2059,8 @@ def cards_generate():
     start_date = data.get("start_date")
     end_date = data.get("end_date")
     force = data.get("force", False)
+    if _card_rebuild_running():
+        return jsonify({"error": "full memory card rebuild is running"}), 409
 
     def _run():
         try:
@@ -1940,6 +2094,9 @@ def cards_generate():
 @require_auth
 def cards_embed():
     """Embed all unembedded memory cards."""
+    if _card_rebuild_running():
+        return jsonify({"error": "full memory card rebuild is running"}), 409
+
     def _run():
         count = embed_pending_cards()
         logger.info(f"[MemoryCard] embed done: {count} cards")
@@ -1956,6 +2113,12 @@ def cards_status():
     from database import get_card_count
     stats = get_card_count()
     stats["card_vector_store_size"] = card_vector_store.size
+    stats["rebuild"] = _get_card_rebuild_state()
+    stats["summary_architecture"] = {
+        "daily_source": "memory_cards",
+        "weekly_source": "derived_from_memory_cards",
+        "legacy_tables_active": False,
+    }
     return jsonify(stats)
 
 
@@ -1964,13 +2127,29 @@ def cards_status():
 def cards_list():
     """List memory cards, optionally filtered by date."""
     date = request.args.get("date")
+    full = request.args.get("full", "0").lower() in ("1", "true", "yes")
+    limit = max(1, min(int(request.args.get("limit", "200")), 1000))
+    offset = max(0, int(request.args.get("offset", "0")))
     if date:
         from database import get_cards_by_date
         cards = get_cards_by_date(date)
     else:
-        from database import get_all_cards
-        cards = get_all_cards()
-    return jsonify({"cards": cards, "count": len(cards)})
+        if full:
+            from database import get_all_cards_full
+            cards = get_all_cards_full()
+        else:
+            from database import get_all_cards
+            cards = get_all_cards()
+    total = len(cards)
+    paged = cards[offset:offset + limit]
+    return jsonify({
+        "cards": paged,
+        "count": len(paged),
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "full": full,
+    })
 
 
 @app.route("/admin/cards/search", methods=["POST"])
@@ -1991,6 +2170,76 @@ def cards_search():
             for c in cards
         ],
     })
+
+
+@app.route("/admin/cards/rebuild_full", methods=["POST"])
+@require_auth
+def cards_rebuild_full():
+    """Safely regenerate all memory cards and replace old summaries."""
+    if _card_rebuild_running():
+        return jsonify({"error": "full memory card rebuild is already running"}), 409
+
+    data = request.get_json(force=True) if request.is_json else {}
+    start_date = data.get("start_date")
+    end_date = data.get("end_date")
+
+    _set_card_rebuild_state(
+        running=True,
+        phase="queued",
+        message="Queued full memory card rebuild",
+        started_at=datetime.now(timezone.utc).isoformat(),
+        completed_at=None,
+        error=None,
+        result=None,
+    )
+
+    def _progress(phase: str, message: str | None = None, **details):
+        state = {"phase": phase}
+        if message is not None:
+            state["message"] = message
+        if details:
+            state["details"] = details
+        _set_card_rebuild_state(**state)
+
+    def _run():
+        try:
+            result = full_regenerate_memory_cards(
+                start_date=start_date,
+                end_date=end_date,
+                progress_cb=_progress,
+            )
+            _set_card_rebuild_state(
+                running=False,
+                phase="completed",
+                message="Full memory card rebuild completed",
+                completed_at=datetime.now(timezone.utc).isoformat(),
+                error=None,
+                result=result,
+            )
+        except Exception as e:
+            logger.error("[MemoryCard] full rebuild failed", exc_info=True)
+            _set_card_rebuild_state(
+                running=False,
+                phase="failed",
+                message="Full memory card rebuild failed",
+                completed_at=datetime.now(timezone.utc).isoformat(),
+                error=str(e),
+            )
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    return jsonify({
+        "status": "started",
+        "start_date": start_date,
+        "end_date": end_date,
+    })
+
+
+@app.route("/admin/cards/rebuild_full/status", methods=["GET"])
+@require_auth
+def cards_rebuild_full_status():
+    """Get current full memory-card rebuild status."""
+    return jsonify(_get_card_rebuild_state())
 
 
 @app.route("/admin/vectors/status", methods=["GET"])
@@ -2016,6 +2265,7 @@ def vectors_status():
             "total_messages": total_msgs,
             "memory_cards": card_stats,
             "card_vector_store_size": card_vector_store.size,
+            "rebuild": _get_vector_rebuild_state(),
         })
     finally:
         conn.close()
@@ -2028,11 +2278,27 @@ def vectors_rebuild():
     Full rebuild: re-chunk all messages + re-embed everything.
     Runs in background, returns immediately.
     """
+    if _card_rebuild_running():
+        return jsonify({"error": "full memory card rebuild is running"}), 409
+    if _vector_rebuild_running():
+        return jsonify({"error": "vector rebuild is already running"}), 409
+
     from database import get_all_chunks_for_rebuild, get_db
     import numpy as _np
 
+    _set_vector_rebuild_state(
+        running=True,
+        phase="queued",
+        message="Queued full vector rebuild",
+        started_at=datetime.now(timezone.utc).isoformat(),
+        completed_at=None,
+        error=None,
+        result=None,
+    )
+
     def _do_rebuild():
         try:
+            _set_vector_rebuild_state(phase="clear_old", message="Clearing old vector chunks")
             # Step 1: Re-chunk all messages from scratch
             conn = get_db()
             try:
@@ -2044,11 +2310,24 @@ def vectors_rebuild():
             logger.info("[Vector] rebuild: cleared old chunks, re-chunking...")
             n_chunks = build_pending_chunks()
             logger.info(f"[Vector] rebuild: created {n_chunks} chunks")
+            _set_vector_rebuild_state(
+                phase="rechunk",
+                message="Rebuilt message chunks",
+                result={"created_chunks": n_chunks},
+            )
 
             # Step 2: Embed all chunks
             all_chunks = get_all_chunks_for_rebuild()
             if not all_chunks:
                 logger.info("[Vector] rebuild: no chunks to embed")
+                _set_vector_rebuild_state(
+                    running=False,
+                    phase="completed",
+                    message="No chunks to embed",
+                    completed_at=datetime.now(timezone.utc).isoformat(),
+                    error=None,
+                    result={"created_chunks": n_chunks, "embedded_vectors": 0},
+                )
                 return
 
             all_vecs = []
@@ -2072,6 +2351,16 @@ def vectors_rebuild():
                 if (i // batch_size) % 100 == 0:
                     logger.info(f"[Vector] rebuild progress: {i+len(batch)}/{len(all_chunks)} chunks, "
                                 f"{len(all_vecs)} embedded, {failed_batches} failed batches")
+                    _set_vector_rebuild_state(
+                        phase="embedding",
+                        message="Embedding message vectors",
+                        details={
+                            "current": i + len(batch),
+                            "total": len(all_chunks),
+                            "embedded": len(all_vecs),
+                            "failed_batches": failed_batches,
+                        },
+                    )
                 # Rate limiting: ~10 calls/sec max
                 if i + batch_size < len(all_chunks):
                     time.sleep(0.2)
@@ -2083,13 +2372,45 @@ def vectors_rebuild():
                 mark_chunks_embedded(all_ids)
                 logger.info(f"[Vector] rebuild complete: {len(all_vecs)} vectors "
                             f"(from {len(all_chunks)} chunks, {failed_batches} failed batches)")
+                _set_vector_rebuild_state(
+                    running=False,
+                    phase="completed",
+                    message="Full vector rebuild completed",
+                    completed_at=datetime.now(timezone.utc).isoformat(),
+                    error=None,
+                    result={
+                        "created_chunks": n_chunks,
+                        "embedded_vectors": len(all_vecs),
+                        "total_chunks": len(all_chunks),
+                        "failed_batches": failed_batches,
+                    },
+                )
             else:
                 logger.warning("[Vector] rebuild: no vectors produced! "
                                f"All {len(all_chunks)} chunks failed embedding. "
                                "Check ALIBABA_API_KEY and embedding API connectivity.")
+                _set_vector_rebuild_state(
+                    running=False,
+                    phase="failed",
+                    message="Vector rebuild produced no vectors",
+                    completed_at=datetime.now(timezone.utc).isoformat(),
+                    error="No vectors produced during rebuild",
+                    result={
+                        "created_chunks": n_chunks,
+                        "total_chunks": len(all_chunks),
+                        "failed_batches": failed_batches,
+                    },
+                )
 
         except Exception:
             logger.error("[Vector] rebuild failed", exc_info=True)
+            _set_vector_rebuild_state(
+                running=False,
+                phase="failed",
+                message="Full vector rebuild failed",
+                completed_at=datetime.now(timezone.utc).isoformat(),
+                error="Vector rebuild raised an exception",
+            )
 
     t = threading.Thread(target=_do_rebuild, daemon=True)
     t.start()
@@ -2100,6 +2421,13 @@ def vectors_rebuild():
     })
 
 
+@app.route("/admin/vectors/rebuild/status", methods=["GET"])
+@require_auth
+def vectors_rebuild_status():
+    """Get current full vector rebuild status."""
+    return jsonify(_get_vector_rebuild_state())
+
+
 @app.route("/admin/vectors/nightly", methods=["POST"])
 @require_auth
 def vectors_nightly():
@@ -2108,13 +2436,46 @@ def vectors_nightly():
     Call this from cron after daily summary, or manually.
     Only processes messages not yet chunked/embedded.
     """
+    if _card_rebuild_running():
+        return jsonify({"error": "full memory card rebuild is running"}), 409
+    if _vector_rebuild_running():
+        return jsonify({"error": "vector rebuild is already running"}), 409
+
+    _set_vector_rebuild_state(
+        running=True,
+        phase="nightly",
+        message="Nightly vector job started",
+        started_at=datetime.now(timezone.utc).isoformat(),
+        completed_at=None,
+        error=None,
+        result=None,
+    )
+
     def _run():
-        count = _do_nightly_vectorize()
-        logger.info(f"[Vector] nightly job done: {count} chunks embedded")
-        # Also embed any pending memory cards
-        card_count = embed_pending_cards()
-        if card_count:
-            logger.info(f"[Vector] nightly: also embedded {card_count} memory cards")
+        try:
+            count = _do_nightly_vectorize()
+            logger.info(f"[Vector] nightly job done: {count} chunks embedded")
+            # Also embed any pending memory cards
+            card_count = embed_pending_cards()
+            if card_count:
+                logger.info(f"[Vector] nightly: also embedded {card_count} memory cards")
+            _set_vector_rebuild_state(
+                running=False,
+                phase="completed",
+                message="Nightly vector job completed",
+                completed_at=datetime.now(timezone.utc).isoformat(),
+                error=None,
+                result={"embedded_chunks": count, "embedded_cards": card_count},
+            )
+        except Exception:
+            logger.error("[Vector] nightly job failed", exc_info=True)
+            _set_vector_rebuild_state(
+                running=False,
+                phase="failed",
+                message="Nightly vector job failed",
+                completed_at=datetime.now(timezone.utc).isoformat(),
+                error="Nightly vector job raised an exception",
+            )
 
     t = threading.Thread(target=_run, daemon=True)
     t.start()
@@ -2122,4 +2483,5 @@ def vectors_nightly():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    debug = os.getenv("FLASK_DEBUG", "").lower() in ("1", "true", "yes")
+    app.run(host="0.0.0.0", port=5000, debug=debug)

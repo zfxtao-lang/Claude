@@ -93,13 +93,13 @@ def exec_notion_read_page(page_id: str) -> str:
     headers = _notion_headers()
     try:
         # Get page metadata (title)
-        logger.info(f"[NotionAPI] read_page: page_id={page_id}")
+        logger.info("[NotionAPI] read_page")
         page_resp = requests.get(f"{_NOTION_API}/pages/{page_id}",
                                  headers=headers, timeout=15)
         logger.info(f"[NotionAPI] read_page response: {page_resp.status_code}")
         if page_resp.status_code != 200:
             error_body = page_resp.text[:500]
-            logger.error(f"[NotionAPI] read_page error: {error_body}")
+            logger.error("[NotionAPI] read_page error")
             return json.dumps({"error": f"Notion API {page_resp.status_code}: {error_body}"})
         page_resp.raise_for_status()
         page_data = page_resp.json()
@@ -142,13 +142,13 @@ def exec_notion_search(query: str) -> str:
             "page_size": 5,
             "sort": {"direction": "descending", "timestamp": "last_edited_time"},
         }
-        logger.info(f"[NotionAPI] search: query='{query}'")
+        logger.info("[NotionAPI] search")
         resp = requests.post(f"{_NOTION_API}/search",
                              headers=headers, json=body, timeout=15)
         logger.info(f"[NotionAPI] search response: {resp.status_code}")
         if resp.status_code != 200:
             error_body = resp.text[:500]
-            logger.error(f"[NotionAPI] search error: {error_body}")
+            logger.error("[NotionAPI] search error")
             return json.dumps({"error": f"Notion API {resp.status_code}: {error_body}"})
         resp.raise_for_status()
         results = resp.json().get("results", [])
@@ -192,14 +192,14 @@ def exec_notion_append(page_id: str, content: str) -> str:
 
     try:
         body = {"children": blocks}
-        logger.info(f"[NotionAPI] append: page_id={page_id}, blocks={len(blocks)}")
+        logger.info(f"[NotionAPI] append: blocks={len(blocks)}")
         resp = requests.patch(
             f"{_NOTION_API}/blocks/{page_id}/children",
             headers=headers, json=body, timeout=15)
         logger.info(f"[NotionAPI] append response: {resp.status_code}")
         if resp.status_code != 200:
             error_body = resp.text[:500]
-            logger.error(f"[NotionAPI] append error: {error_body}")
+            logger.error("[NotionAPI] append error")
             return json.dumps({
                 "error": f"Notion API {resp.status_code}: {error_body}",
                 "page_id": page_id,
@@ -241,14 +241,14 @@ def exec_notion_query_database(database_id: str, filter_json: str = "",
                           "direction": "descending"}]
 
     try:
-        logger.info(f"[NotionAPI] query_database: db_id={database_id}, limit={limit}")
+        logger.info(f"[NotionAPI] query_database: limit={limit}")
         resp = requests.post(
             f"{_NOTION_API}/databases/{database_id}/query",
             headers=headers, json=body, timeout=15)
         logger.info(f"[NotionAPI] query_database response: {resp.status_code}")
         if resp.status_code != 200:
             error_body = resp.text[:500]
-            logger.error(f"[NotionAPI] query_database error: {error_body}")
+            logger.error("[NotionAPI] query_database error")
             return json.dumps({"error": f"Notion API {resp.status_code}: {error_body}"})
 
         results = resp.json().get("results", [])

@@ -116,6 +116,8 @@ def init_db():
             tokenize='unicode61'
         );
 
+        -- Legacy only: kept for rollback/history reference. New summary pipeline
+        -- uses memory_cards + rolling summaries instead of writing these tables.
         CREATE TABLE IF NOT EXISTS daily_summary (
             date TEXT PRIMARY KEY,
             summary TEXT,
@@ -123,6 +125,7 @@ def init_db():
             created_at TEXT DEFAULT (datetime('now'))
         );
 
+        -- Legacy only: do not use as an active summary source.
         CREATE TABLE IF NOT EXISTS weekly_summary (
             week TEXT PRIMARY KEY,
             summary TEXT,
@@ -428,7 +431,7 @@ def search_history(query: str, limit: int = 5, max_chars: int = 4000,
     def _add_rows(rows):
         for row in rows:
             d = dict(row)
-            key = (d["conversation_id"], d["created_at"])
+            key = d.get("id") or (d["conversation_id"], d["created_at"], d["content"])
             if key not in seen:
                 seen.add(key)
                 results.append(d)
@@ -444,7 +447,7 @@ def search_history(query: str, limit: int = 5, max_chars: int = 4000,
 
             # First try exact query match
             exact_rows = conn.execute(
-                f"""SELECT role, content, created_at, conversation_id
+                f"""SELECT id, role, content, created_at, conversation_id
                     FROM messages WHERE content LIKE ? AND {recency_filter}
                     ORDER BY id DESC LIMIT ?""",
                 (f"%{query}%", id_cutoff, limit)
@@ -456,7 +459,7 @@ def search_history(query: str, limit: int = 5, max_chars: int = 4000,
             if len(results) < limit and len(keywords) > 1:
                 where_sql, params = _build_like_conditions(keywords)
                 kw_rows = conn.execute(
-                    f"""SELECT role, content, created_at, conversation_id
+                    f"""SELECT id, role, content, created_at, conversation_id
                         FROM messages WHERE {where_sql} AND {recency_filter}
                         ORDER BY id DESC LIMIT ?""",
                     params + [id_cutoff, limit - len(results)]
@@ -472,7 +475,7 @@ def search_history(query: str, limit: int = 5, max_chars: int = 4000,
                     if len(kw) < 2:
                         continue  # skip single-char tokens for noise reduction
                     single_rows = conn.execute(
-                        f"""SELECT role, content, created_at, conversation_id
+                        f"""SELECT id, role, content, created_at, conversation_id
                             FROM messages WHERE content LIKE ? AND {recency_filter}
                             ORDER BY id DESC LIMIT ?""",
                         (f"%{kw}%", id_cutoff, limit - len(results))
@@ -487,9 +490,9 @@ def search_history(query: str, limit: int = 5, max_chars: int = 4000,
             if safe_fts_query:
                 try:
                     fts_rows = conn.execute(
-                        f"""SELECT m.role, m.content, m.created_at, m.conversation_id
+                        f"""SELECT m.id, m.role, m.content, m.created_at, m.conversation_id
                             FROM messages_fts f
-                            JOIN messages m ON m.conversation_id = f.conversation_id
+                            JOIN messages m ON m.id = f.rowid
                             WHERE messages_fts MATCH ? AND m.{recency_filter}
                             ORDER BY m.id DESC
                             LIMIT ?""",
@@ -819,6 +822,29 @@ def get_dates_without_cards(start_date: str = None, end_date: str = None) -> lis
         conn.close()
 
 
+def get_all_message_dates(start_date: str = None, end_date: str = None) -> list[str]:
+    """Get all distinct message dates that have non-empty content."""
+    conn = get_db()
+    try:
+        sql = """
+            SELECT DISTINCT date(created_at) as d
+            FROM messages
+            WHERE content IS NOT NULL AND content != ''
+        """
+        params = []
+        if start_date:
+            sql += " AND date(created_at) >= ?"
+            params.append(start_date)
+        if end_date:
+            sql += " AND date(created_at) <= ?"
+            params.append(end_date)
+        sql += " ORDER BY d"
+        rows = conn.execute(sql, params).fetchall()
+        return [r[0] for r in rows if r[0]]
+    finally:
+        conn.close()
+
+
 def save_memory_card(date: str, summary: str, tags: str = "",
                      conversation_ids: str = "",
                      msg_id_start: int = 0, msg_id_end: int = 0) -> int:
@@ -909,6 +935,73 @@ def get_all_cards() -> list[dict]:
         conn.close()
 
 
+def get_all_cards_full() -> list[dict]:
+    """Get full memory card records ordered by date then id."""
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            """SELECT id, date, summary, tags, conversation_ids,
+                      msg_id_start, msg_id_end, has_embedding, created_at
+               FROM memory_cards
+               ORDER BY date, id"""
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def export_memory_cards_backup(label: str | None = None) -> str:
+    """Export current memory_cards records to a JSON backup file."""
+    os.makedirs(DB_BACKUP_DIR, exist_ok=True)
+    stamp = label or datetime.now().strftime("%Y%m%d_%H%M%S")
+    dest = os.path.join(DB_BACKUP_DIR, f"memory_cards_{stamp}.json")
+    cards = get_all_cards_full()
+    with open(dest, "w", encoding="utf-8") as f:
+        json.dump(cards, f, ensure_ascii=False, indent=2)
+    return dest
+
+
+def replace_all_memory_cards(cards: list[dict]) -> list[dict]:
+    """
+    Replace the entire memory_cards table with the provided dataset.
+    Each card may include an explicit id/has_embedding/created_at.
+    """
+    conn = get_db()
+    try:
+        conn.execute("DELETE FROM memory_cards")
+        for idx, card in enumerate(cards, start=1):
+            card_id = int(card.get("id") or idx)
+            has_embedding = int(card.get("has_embedding", 0))
+            created_at = card.get("created_at") or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            conn.execute(
+                """INSERT INTO memory_cards
+                   (id, date, summary, tags, conversation_ids,
+                    msg_id_start, msg_id_end, has_embedding, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    card_id,
+                    card["date"],
+                    card["summary"],
+                    card.get("tags", ""),
+                    card.get("conversation_ids", ""),
+                    int(card.get("msg_id_start", 0)),
+                    int(card.get("msg_id_end", 0)),
+                    has_embedding,
+                    created_at,
+                )
+            )
+        conn.commit()
+        rows = conn.execute(
+            """SELECT id, date, summary, tags, conversation_ids,
+                      msg_id_start, msg_id_end, has_embedding, created_at
+               FROM memory_cards
+               ORDER BY date, id"""
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
 def get_recent_cards(days: int = 3) -> list[dict]:
     """Get memory cards from the last N days (unconditional, for session context)."""
     conn = get_db()
@@ -925,7 +1018,8 @@ def get_recent_cards(days: int = 3) -> list[dict]:
         conn.close()
 
 
-def get_recent_cross_window_messages(limit: int = 30) -> list[dict]:
+def get_recent_cross_window_messages(limit: int = 30,
+                                     exclude_conversation_id: str | None = None) -> list[dict]:
     """
     Get recent messages from today for cross-window context.
     Returns the last N messages from today, across all conversation windows.
@@ -933,14 +1027,17 @@ def get_recent_cross_window_messages(limit: int = 30) -> list[dict]:
     conn = get_db()
     try:
         today = datetime.now().strftime("%Y-%m-%d")
-        rows = conn.execute(
-            """SELECT role, content, created_at, conversation_id
-               FROM messages
-               WHERE created_at >= ?
-                 AND content IS NOT NULL AND content != ''
-               ORDER BY id DESC LIMIT ?""",
-            (today, limit)
-        ).fetchall()
+        sql = """SELECT role, content, created_at, conversation_id
+                 FROM messages
+                 WHERE created_at >= ?
+                   AND content IS NOT NULL AND content != ''"""
+        params: list = [today]
+        if exclude_conversation_id:
+            sql += " AND conversation_id != ?"
+            params.append(exclude_conversation_id)
+        sql += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        rows = conn.execute(sql, params).fetchall()
         return [dict(r) for r in reversed(rows)]
     finally:
         conn.close()

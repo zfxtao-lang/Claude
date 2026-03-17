@@ -80,7 +80,7 @@ def _get_calendar():
     if not CALDAV_USERNAME or not CALDAV_PASSWORD:
         raise RuntimeError("CalDAV credentials not configured (CALDAV_USERNAME / CALDAV_PASSWORD)")
 
-    logger.info(f"[Calendar] connecting to {CALDAV_URL} as {CALDAV_USERNAME[:3]}***")
+    logger.info(f"[Calendar] connecting to {CALDAV_URL}")
     client = caldav.DAVClient(
         url=CALDAV_URL,
         username=CALDAV_USERNAME,
@@ -88,26 +88,25 @@ def _get_calendar():
     )
     principal = client.principal()
     calendars = principal.calendars()
-    logger.info(f"[Calendar] found {len(calendars)} calendars: "
-                f"{[c.name for c in calendars]}")
+    logger.info(f"[Calendar] found {len(calendars)} calendars")
 
     # Find the target calendar by name
     for cal in calendars:
         if cal.name == CALDAV_CALENDAR_NAME:
-            logger.info(f"[Calendar] found calendar: {cal.name}")
+            logger.info("[Calendar] found target calendar")
             return cal
 
     # If target calendar doesn't exist, try to create it
-    logger.info(f"[Calendar] calendar '{CALDAV_CALENDAR_NAME}' not found, creating...")
+    logger.info("[Calendar] target calendar not found, creating")
     try:
         cal = principal.make_calendar(name=CALDAV_CALENDAR_NAME)
-        logger.info(f"[Calendar] created calendar: {CALDAV_CALENDAR_NAME}")
+        logger.info("[Calendar] created target calendar")
         return cal
     except Exception as e:
         logger.warning(f"[Calendar] failed to create calendar: {e}")
         # Fall back to the first available calendar
         if calendars:
-            logger.info(f"[Calendar] falling back to: {calendars[0].name}")
+            logger.info("[Calendar] falling back to first available calendar")
             return calendars[0]
         raise RuntimeError("No calendars available on this CalDAV account")
 
@@ -208,11 +207,9 @@ def execute_add_calendar_event(arguments: dict) -> str:
 
     try:
         cal = _get_calendar()
-        logger.info(f"[Calendar] saving event UID={event_uid}, title='{title}', "
-                     f"start={start_utc}, end={end_utc}")
+        logger.info(f"[Calendar] saving event UID={event_uid}, start={start_utc}, end={end_utc}")
         event = cal.save_event(vcal_str)
-        logger.info(f"[Calendar] event created OK: '{title}' at {start_dt.isoformat()}, "
-                     f"url={getattr(event, 'url', 'n/a')}")
+        logger.info(f"[Calendar] event created OK at {start_dt.isoformat()}")
         return json.dumps({
             "success": True,
             "title": title,

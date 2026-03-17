@@ -281,6 +281,19 @@ class VectorStore:
             self._loaded = True
         self.save()
 
+    def clear(self):
+        """Clear in-memory vectors and delete persisted vector files."""
+        with self._lock:
+            self._vectors = None
+            self._chunk_ids = None
+            self._loaded = True
+        for path in (VECTOR_FILE, VECTOR_IDS_FILE):
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except OSError:
+                logger.warning(f"[Vector] failed to remove vector file: {path}")
+
 
 CARD_VECTOR_FILE = os.getenv("CARD_VECTOR_FILE", "card_vectors.npy")
 CARD_VECTOR_IDS_FILE = os.getenv("CARD_VECTOR_IDS_FILE", "card_vectors_ids.npy")
@@ -317,6 +330,18 @@ class CardVectorStore(VectorStore):
                 np.save(CARD_VECTOR_FILE, self._vectors)
                 np.save(CARD_VECTOR_IDS_FILE, self._chunk_ids)
                 logger.info(f"[CardVector] saved {len(self._chunk_ids)} card vectors to disk")
+
+    def clear(self):
+        with self._lock:
+            self._vectors = None
+            self._chunk_ids = None
+            self._loaded = True
+        for path in (CARD_VECTOR_FILE, CARD_VECTOR_IDS_FILE):
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except OSError:
+                logger.warning(f"[CardVector] failed to remove card vector file: {path}")
 
 
 # Global instances
