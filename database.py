@@ -167,6 +167,165 @@ def init_db():
             ON memory_cards(date);
         CREATE INDEX IF NOT EXISTS idx_cards_embedding
             ON memory_cards(has_embedding);
+
+        CREATE TABLE IF NOT EXISTS memory_slices (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            conversation_id TEXT NOT NULL DEFAULT '',
+            conversation_ids TEXT NOT NULL DEFAULT '',
+            slice_index INTEGER NOT NULL DEFAULT 0,
+            msg_id_start INTEGER NOT NULL,
+            msg_id_end INTEGER NOT NULL,
+            message_count INTEGER NOT NULL DEFAULT 0,
+            summary TEXT NOT NULL,
+            tags TEXT DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'active',
+            source_long_memory_id INTEGER,
+            has_embedding INTEGER NOT NULL DEFAULT 0,
+            meta_json TEXT DEFAULT '{}',
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_memory_slices_status
+            ON memory_slices(status, id);
+        CREATE INDEX IF NOT EXISTS idx_memory_slices_msg_range
+            ON memory_slices(msg_id_start, msg_id_end);
+        CREATE INDEX IF NOT EXISTS idx_memory_slices_source_long_memory
+            ON memory_slices(source_long_memory_id);
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_memory_slices_msg_range
+            ON memory_slices(msg_id_start, msg_id_end);
+
+        CREATE TABLE IF NOT EXISTS long_term_memories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            memory_type TEXT NOT NULL DEFAULT 'summary',
+            title TEXT DEFAULT '',
+            content TEXT NOT NULL,
+            fact_weight REAL NOT NULL DEFAULT 1.0,
+            half_life_days REAL NOT NULL DEFAULT 30.0,
+            hits INTEGER NOT NULL DEFAULT 0,
+            last_hit_at TEXT,
+            source_slice_start_id INTEGER DEFAULT 0,
+            source_slice_end_id INTEGER DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'active',
+            has_embedding INTEGER NOT NULL DEFAULT 0,
+            meta_json TEXT DEFAULT '{}',
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_long_term_memories_status
+            ON long_term_memories(status, id);
+        CREATE INDEX IF NOT EXISTS idx_long_term_memories_embedding
+            ON long_term_memories(has_embedding);
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_long_term_memories_source_range
+            ON long_term_memories(source_slice_start_id, source_slice_end_id);
+
+        CREATE TABLE IF NOT EXISTS long_term_memory_sources (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            long_term_memory_id INTEGER NOT NULL,
+            memory_slice_id INTEGER NOT NULL,
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_long_term_memory_sources_long
+            ON long_term_memory_sources(long_term_memory_id);
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_long_term_memory_sources_pair
+            ON long_term_memory_sources(long_term_memory_id, memory_slice_id);
+
+        CREATE TABLE IF NOT EXISTS diary_entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            entry_date TEXT NOT NULL,
+            title TEXT DEFAULT '',
+            content TEXT NOT NULL,
+            mood_score INTEGER NOT NULL DEFAULT 5,
+            mood_label TEXT DEFAULT '',
+            source_msg_id_start INTEGER DEFAULT 0,
+            source_msg_id_end INTEGER DEFAULT 0,
+            source_slice_ids TEXT DEFAULT '',
+            worker_run_id INTEGER,
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_diary_entries_date
+            ON diary_entries(entry_date DESC, id DESC);
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_diary_entries_entry_date
+            ON diary_entries(entry_date);
+
+        CREATE TABLE IF NOT EXISTS persona_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            snapshot_date TEXT NOT NULL,
+            persona_json TEXT NOT NULL DEFAULT '{}',
+            relationship_json TEXT NOT NULL DEFAULT '{}',
+            summary TEXT DEFAULT '',
+            source_diary_id INTEGER,
+            worker_run_id INTEGER,
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_persona_snapshots_date
+            ON persona_snapshots(snapshot_date DESC, id DESC);
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_persona_snapshots_diary
+            ON persona_snapshots(snapshot_date, source_diary_id);
+
+        CREATE TABLE IF NOT EXISTS pending_reviews (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            review_type TEXT NOT NULL,
+            source_snapshot_id INTEGER,
+            proposed_payload TEXT NOT NULL DEFAULT '{}',
+            diff_summary TEXT DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'pending',
+            review_note TEXT DEFAULT '',
+            edited_payload TEXT DEFAULT '',
+            approved_payload TEXT DEFAULT '',
+            created_at TEXT DEFAULT (datetime('now')),
+            reviewed_at TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_pending_reviews_status
+            ON pending_reviews(status, id DESC);
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_pending_reviews_snapshot_type
+            ON pending_reviews(review_type, source_snapshot_id);
+
+        CREATE TABLE IF NOT EXISTS active_profile (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            profile_json TEXT NOT NULL DEFAULT '{}',
+            relationship_json TEXT NOT NULL DEFAULT '{}',
+            source_review_id INTEGER,
+            updated_at TEXT DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS review_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            pending_review_id INTEGER NOT NULL,
+            action TEXT NOT NULL,
+            before_payload TEXT DEFAULT '',
+            after_payload TEXT DEFAULT '',
+            note TEXT DEFAULT '',
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_review_history_queue
+            ON review_history(pending_review_id, id DESC);
+
+        CREATE TABLE IF NOT EXISTS worker_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            worker_name TEXT NOT NULL DEFAULT 'memory_worker',
+            run_mode TEXT NOT NULL DEFAULT 'manual',
+            status TEXT NOT NULL DEFAULT 'queued',
+            phase TEXT NOT NULL DEFAULT 'queued',
+            message TEXT DEFAULT '',
+            started_at TEXT DEFAULT (datetime('now')),
+            completed_at TEXT,
+            token_input INTEGER NOT NULL DEFAULT 0,
+            token_output INTEGER NOT NULL DEFAULT 0,
+            token_total INTEGER NOT NULL DEFAULT 0,
+            result_json TEXT DEFAULT '{}',
+            error TEXT DEFAULT ''
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_worker_runs_started
+            ON worker_runs(started_at DESC, id DESC);
     """)
     conn.commit()
 
@@ -1055,6 +1214,890 @@ def get_card_count() -> dict:
             "SELECT COUNT(DISTINCT date) FROM memory_cards"
         ).fetchone()[0]
         return {"total": total, "embedded": embedded, "dates": dates}
+    finally:
+        conn.close()
+
+
+def _json_dump(value) -> str:
+    return json.dumps(value if value is not None else {}, ensure_ascii=False)
+
+
+def _row_to_dict(row):
+    return dict(row) if row is not None else None
+
+
+# ---------- New Memory Architecture ----------
+
+def get_last_sliced_message_id() -> int:
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT COALESCE(MAX(msg_id_end), 0) AS max_id FROM memory_slices"
+        ).fetchone()
+        return int(row["max_id"] if row else 0)
+    finally:
+        conn.close()
+
+
+def get_next_memory_slice_index() -> int:
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT COALESCE(MAX(slice_index), 0) AS max_idx FROM memory_slices"
+        ).fetchone()
+        return int((row["max_idx"] if row else 0) or 0) + 1
+    finally:
+        conn.close()
+
+
+def get_unsliced_messages(limit: int = 500) -> list[dict]:
+    conn = get_db()
+    try:
+        last_id = get_last_sliced_message_id()
+        rows = conn.execute(
+            """SELECT id, conversation_id, role, content, model, provider, created_at
+               FROM messages
+               WHERE id > ?
+                 AND content IS NOT NULL AND trim(content) != ''
+               ORDER BY id
+               LIMIT ?""",
+            (last_id, limit)
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_messages_by_range(msg_id_start: int, msg_id_end: int) -> list[dict]:
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            """SELECT id, conversation_id, role, content, model, provider, created_at
+               FROM messages
+               WHERE id BETWEEN ? AND ?
+               ORDER BY id""",
+            (msg_id_start, msg_id_end)
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_memory_slices_overlapping_range(msg_id_start: int, msg_id_end: int,
+                                        limit: int = 10) -> list[dict]:
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            """SELECT * FROM memory_slices
+               WHERE status = 'active'
+                 AND msg_id_end >= ?
+                 AND msg_id_start <= ?
+               ORDER BY msg_id_end DESC
+               LIMIT ?""",
+            (msg_id_start, msg_id_end, limit)
+        ).fetchall()
+        return [dict(r) for r in reversed(rows)]
+    finally:
+        conn.close()
+
+
+def save_memory_slice(conversation_id: str, slice_index: int, msg_id_start: int,
+                      msg_id_end: int, message_count: int, summary: str,
+                      tags: str = "", conversation_ids: str = "",
+                      status: str = "active", source_long_memory_id: int | None = None,
+                      has_embedding: int = 0, meta_json=None) -> int:
+    conn = get_db()
+    try:
+        existing = conn.execute(
+            "SELECT id FROM memory_slices WHERE msg_id_start = ? AND msg_id_end = ?",
+            (msg_id_start, msg_id_end)
+        ).fetchone()
+        if existing:
+            return int(existing["id"])
+        cursor = conn.execute(
+            """INSERT INTO memory_slices
+               (conversation_id, conversation_ids, slice_index, msg_id_start, msg_id_end,
+                message_count, summary, tags, status, source_long_memory_id,
+                has_embedding, meta_json, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))""",
+            (
+                conversation_id,
+                conversation_ids,
+                slice_index,
+                msg_id_start,
+                msg_id_end,
+                message_count,
+                summary,
+                tags,
+                status,
+                source_long_memory_id,
+                has_embedding,
+                _json_dump(meta_json),
+            )
+        )
+        conn.commit()
+        return cursor.lastrowid
+    finally:
+        conn.close()
+
+
+def get_memory_slice(slice_id: int) -> dict | None:
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT * FROM memory_slices WHERE id = ?", (slice_id,)).fetchone()
+        return _row_to_dict(row)
+    finally:
+        conn.close()
+
+
+def list_memory_slices(status: str | None = None, limit: int = 50, offset: int = 0) -> list[dict]:
+    conn = get_db()
+    try:
+        params: list = []
+        sql = "SELECT * FROM memory_slices"
+        if status:
+            sql += " WHERE status = ?"
+            params.append(status)
+        sql += " ORDER BY id DESC LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+        rows = conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def count_memory_slices(status: str | None = None) -> int:
+    conn = get_db()
+    try:
+        if status:
+            row = conn.execute(
+                "SELECT COUNT(*) AS c FROM memory_slices WHERE status = ?", (status,)
+            ).fetchone()
+        else:
+            row = conn.execute("SELECT COUNT(*) AS c FROM memory_slices").fetchone()
+        return int(row["c"] if row else 0)
+    finally:
+        conn.close()
+
+
+def update_memory_slice(slice_id: int, **updates) -> dict | None:
+    allowed = {
+        "summary", "tags", "status", "source_long_memory_id",
+        "has_embedding", "meta_json",
+    }
+    fields = []
+    params = []
+    for key, value in updates.items():
+        if key not in allowed:
+            continue
+        fields.append(f"{key} = ?")
+        if key == "meta_json":
+            params.append(_json_dump(value))
+        else:
+            params.append(value)
+    if not fields:
+        return get_memory_slice(slice_id)
+    params.extend([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), slice_id])
+    conn = get_db()
+    try:
+        conn.execute(
+            f"UPDATE memory_slices SET {', '.join(fields)}, updated_at = ? WHERE id = ?",
+            params
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM memory_slices WHERE id = ?", (slice_id,)).fetchone()
+        return _row_to_dict(row)
+    finally:
+        conn.close()
+
+
+def delete_memory_slice(slice_id: int):
+    conn = get_db()
+    try:
+        conn.execute("DELETE FROM memory_slices WHERE id = ?", (slice_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_recent_active_slices(limit: int = 4) -> list[dict]:
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            """SELECT * FROM memory_slices
+               WHERE status = 'active'
+               ORDER BY id DESC
+               LIMIT ?""",
+            (limit,)
+        ).fetchall()
+        return [dict(r) for r in reversed(rows)]
+    finally:
+        conn.close()
+
+
+def get_compactable_slice_groups(group_size: int = 4) -> list[list[dict]]:
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            """SELECT * FROM memory_slices
+               WHERE status = 'active'
+               ORDER BY id ASC"""
+        ).fetchall()
+        slices = [dict(r) for r in rows]
+        return [slices[i:i + group_size] for i in range(0, len(slices), group_size)
+                if len(slices[i:i + group_size]) == group_size]
+    finally:
+        conn.close()
+
+
+def mark_memory_slices_compacted(slice_ids: list[int], long_memory_id: int):
+    if not slice_ids:
+        return
+    conn = get_db()
+    try:
+        placeholders = ",".join("?" * len(slice_ids))
+        conn.execute(
+            f"""UPDATE memory_slices
+                SET status = 'compacted',
+                    source_long_memory_id = ?,
+                    updated_at = datetime('now')
+                WHERE id IN ({placeholders})""",
+            [long_memory_id, *slice_ids]
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def save_long_term_memory(memory_type: str, title: str, content: str,
+                          fact_weight: float = 1.0, half_life_days: float = 30.0,
+                          source_slice_start_id: int = 0, source_slice_end_id: int = 0,
+                          status: str = "active", has_embedding: int = 0,
+                          meta_json=None) -> int:
+    conn = get_db()
+    try:
+        existing = conn.execute(
+            """SELECT id FROM long_term_memories
+               WHERE source_slice_start_id = ? AND source_slice_end_id = ?""",
+            (source_slice_start_id, source_slice_end_id)
+        ).fetchone()
+        if existing:
+            return int(existing["id"])
+        cursor = conn.execute(
+            """INSERT INTO long_term_memories
+               (memory_type, title, content, fact_weight, half_life_days,
+                source_slice_start_id, source_slice_end_id, status, has_embedding,
+                meta_json, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))""",
+            (
+                memory_type,
+                title,
+                content,
+                fact_weight,
+                half_life_days,
+                source_slice_start_id,
+                source_slice_end_id,
+                status,
+                has_embedding,
+                _json_dump(meta_json),
+            )
+        )
+        conn.commit()
+        return cursor.lastrowid
+    finally:
+        conn.close()
+
+
+def link_long_term_memory_sources(long_memory_id: int, slice_ids: list[int]):
+    if not slice_ids:
+        return
+    conn = get_db()
+    try:
+        conn.executemany(
+            """INSERT OR IGNORE INTO long_term_memory_sources (long_term_memory_id, memory_slice_id)
+               VALUES (?, ?)""",
+            [(long_memory_id, slice_id) for slice_id in slice_ids]
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_long_term_memory(memory_id: int) -> dict | None:
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT * FROM long_term_memories WHERE id = ?", (memory_id,)
+        ).fetchone()
+        return _row_to_dict(row)
+    finally:
+        conn.close()
+
+
+def get_long_term_memories_by_ids(memory_ids: list[int]) -> list[dict]:
+    if not memory_ids:
+        return []
+    conn = get_db()
+    try:
+        placeholders = ",".join("?" * len(memory_ids))
+        rows = conn.execute(
+            f"SELECT * FROM long_term_memories WHERE id IN ({placeholders})",
+            memory_ids
+        ).fetchall()
+        row_map = {dict(r)["id"]: dict(r) for r in rows}
+        return [row_map[mid] for mid in memory_ids if mid in row_map]
+    finally:
+        conn.close()
+
+
+def list_long_term_memories(status: str | None = None, limit: int = 50,
+                            offset: int = 0) -> list[dict]:
+    conn = get_db()
+    try:
+        params: list = []
+        sql = "SELECT * FROM long_term_memories"
+        if status:
+            sql += " WHERE status = ?"
+            params.append(status)
+        sql += " ORDER BY id DESC LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+        rows = conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def count_long_term_memories(status: str | None = None) -> int:
+    conn = get_db()
+    try:
+        if status:
+            row = conn.execute(
+                "SELECT COUNT(*) AS c FROM long_term_memories WHERE status = ?", (status,)
+            ).fetchone()
+        else:
+            row = conn.execute("SELECT COUNT(*) AS c FROM long_term_memories").fetchone()
+        return int(row["c"] if row else 0)
+    finally:
+        conn.close()
+
+
+def update_long_term_memory(memory_id: int, **updates) -> dict | None:
+    allowed = {
+        "memory_type", "title", "content", "fact_weight", "half_life_days",
+        "hits", "last_hit_at", "status", "has_embedding", "meta_json",
+        "source_slice_start_id", "source_slice_end_id",
+    }
+    fields = []
+    params = []
+    for key, value in updates.items():
+        if key not in allowed:
+            continue
+        fields.append(f"{key} = ?")
+        if key == "meta_json":
+            params.append(_json_dump(value))
+        else:
+            params.append(value)
+    if not fields:
+        return get_long_term_memory(memory_id)
+    params.extend([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), memory_id])
+    conn = get_db()
+    try:
+        conn.execute(
+            f"UPDATE long_term_memories SET {', '.join(fields)}, updated_at = ? WHERE id = ?",
+            params
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM long_term_memories WHERE id = ?", (memory_id,)
+        ).fetchone()
+        return _row_to_dict(row)
+    finally:
+        conn.close()
+
+
+def delete_long_term_memory(memory_id: int):
+    conn = get_db()
+    try:
+        conn.execute("DELETE FROM long_term_memory_sources WHERE long_term_memory_id = ?", (memory_id,))
+        conn.execute("DELETE FROM long_term_memories WHERE id = ?", (memory_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_unembedded_long_term_memories(limit: int = 50) -> list[dict]:
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            """SELECT id, content FROM long_term_memories
+               WHERE has_embedding = 0 AND status = 'active'
+               ORDER BY id LIMIT ?""",
+            (limit,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def mark_long_term_memories_embedded(memory_ids: list[int]):
+    if not memory_ids:
+        return
+    conn = get_db()
+    try:
+        placeholders = ",".join("?" * len(memory_ids))
+        conn.execute(
+            f"""UPDATE long_term_memories
+                SET has_embedding = 1, updated_at = datetime('now')
+                WHERE id IN ({placeholders})""",
+            memory_ids
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def increment_long_term_memory_hits(memory_ids: list[int]):
+    if not memory_ids:
+        return
+    conn = get_db()
+    try:
+        placeholders = ",".join("?" * len(memory_ids))
+        conn.execute(
+            f"""UPDATE long_term_memories
+                SET hits = hits + 1,
+                    last_hit_at = datetime('now'),
+                    updated_at = datetime('now')
+                WHERE id IN ({placeholders})""",
+            memory_ids
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def save_diary_entry(entry_date: str, title: str, content: str, mood_score: int = 5,
+                     mood_label: str = "", source_msg_id_start: int = 0, source_msg_id_end: int = 0,
+                     source_slice_ids: str = "", worker_run_id: int | None = None) -> int:
+    conn = get_db()
+    try:
+        existing = conn.execute(
+            "SELECT id FROM diary_entries WHERE entry_date = ?",
+            (entry_date,)
+        ).fetchone()
+        if existing:
+            conn.execute(
+                """UPDATE diary_entries
+                   SET title = ?, content = ?, mood_score = ?, mood_label = ?,
+                       source_msg_id_start = ?, source_msg_id_end = ?, source_slice_ids = ?,
+                       worker_run_id = ?, updated_at = datetime('now')
+                   WHERE id = ?""",
+                (
+                    title, content, mood_score, mood_label, source_msg_id_start,
+                    source_msg_id_end, source_slice_ids, worker_run_id, int(existing["id"])
+                )
+            )
+            conn.commit()
+            return int(existing["id"])
+        cursor = conn.execute(
+            """INSERT INTO diary_entries
+               (entry_date, title, content, mood_score, mood_label, source_msg_id_start, source_msg_id_end,
+                source_slice_ids, worker_run_id, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))""",
+            (
+                entry_date,
+                title,
+                content,
+                mood_score,
+                mood_label,
+                source_msg_id_start,
+                source_msg_id_end,
+                source_slice_ids,
+                worker_run_id,
+            )
+        )
+        conn.commit()
+        return cursor.lastrowid
+    finally:
+        conn.close()
+
+
+def get_diary_entry(entry_id: int) -> dict | None:
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT * FROM diary_entries WHERE id = ?", (entry_id,)).fetchone()
+        return _row_to_dict(row)
+    finally:
+        conn.close()
+
+
+def list_diary_entries(limit: int = 50, offset: int = 0) -> list[dict]:
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            """SELECT * FROM diary_entries
+               ORDER BY entry_date DESC, id DESC
+               LIMIT ? OFFSET ?""",
+            (limit, offset)
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def update_diary_entry(entry_id: int, **updates) -> dict | None:
+    allowed = {"title", "content", "mood_score", "mood_label", "source_slice_ids"}
+    fields = []
+    params = []
+    for key, value in updates.items():
+        if key in allowed:
+            fields.append(f"{key} = ?")
+            params.append(value)
+    if not fields:
+        return get_diary_entry(entry_id)
+    params.extend([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), entry_id])
+    conn = get_db()
+    try:
+        conn.execute(
+            f"UPDATE diary_entries SET {', '.join(fields)}, updated_at = ? WHERE id = ?",
+            params
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM diary_entries WHERE id = ?", (entry_id,)).fetchone()
+        return _row_to_dict(row)
+    finally:
+        conn.close()
+
+
+def delete_diary_entry(entry_id: int):
+    conn = get_db()
+    try:
+        conn.execute("DELETE FROM diary_entries WHERE id = ?", (entry_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def save_persona_snapshot(snapshot_date: str, persona_json, relationship_json,
+                          summary: str = "", source_diary_id: int | None = None,
+                          worker_run_id: int | None = None) -> int:
+    conn = get_db()
+    try:
+        existing = conn.execute(
+            """SELECT id FROM persona_snapshots
+               WHERE snapshot_date = ? AND source_diary_id IS ?""",
+            (snapshot_date, source_diary_id)
+        ).fetchone()
+        if existing:
+            return int(existing["id"])
+        cursor = conn.execute(
+            """INSERT INTO persona_snapshots
+               (snapshot_date, persona_json, relationship_json, summary, source_diary_id, worker_run_id)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                snapshot_date,
+                _json_dump(persona_json),
+                _json_dump(relationship_json),
+                summary,
+                source_diary_id,
+                worker_run_id,
+            )
+        )
+        conn.commit()
+        return cursor.lastrowid
+    finally:
+        conn.close()
+
+
+def list_persona_snapshots(limit: int = 20, offset: int = 0) -> list[dict]:
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            """SELECT * FROM persona_snapshots
+               ORDER BY snapshot_date DESC, id DESC
+               LIMIT ? OFFSET ?""",
+            (limit, offset)
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def save_pending_review(review_type: str, proposed_payload, diff_summary: str = "",
+                        source_snapshot_id: int | None = None, status: str = "pending") -> int:
+    conn = get_db()
+    try:
+        existing = conn.execute(
+            """SELECT id FROM pending_reviews
+               WHERE review_type = ? AND source_snapshot_id IS ?""",
+            (review_type, source_snapshot_id)
+        ).fetchone()
+        if existing:
+            conn.execute(
+                """UPDATE pending_reviews
+                   SET proposed_payload = ?, diff_summary = ?, status = ?,
+                       review_note = '', edited_payload = '', approved_payload = '',
+                       reviewed_at = NULL
+                   WHERE id = ?""",
+                (
+                    _json_dump(proposed_payload),
+                    diff_summary,
+                    status,
+                    int(existing["id"]),
+                )
+            )
+            conn.commit()
+            return int(existing["id"])
+        cursor = conn.execute(
+            """INSERT INTO pending_reviews
+               (review_type, source_snapshot_id, proposed_payload, diff_summary, status)
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                review_type,
+                source_snapshot_id,
+                _json_dump(proposed_payload),
+                diff_summary,
+                status,
+            )
+        )
+        conn.commit()
+        return cursor.lastrowid
+    finally:
+        conn.close()
+
+
+def get_pending_review(review_id: int) -> dict | None:
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT * FROM pending_reviews WHERE id = ?", (review_id,)).fetchone()
+        return _row_to_dict(row)
+    finally:
+        conn.close()
+
+
+def list_pending_reviews(status: str | None = None, limit: int = 50, offset: int = 0) -> list[dict]:
+    conn = get_db()
+    try:
+        params: list = []
+        sql = "SELECT * FROM pending_reviews"
+        if status:
+            sql += " WHERE status = ?"
+            params.append(status)
+        sql += " ORDER BY id DESC LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+        rows = conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def append_review_history(pending_review_id: int, action: str, before_payload=None,
+                          after_payload=None, note: str = ""):
+    conn = get_db()
+    try:
+        conn.execute(
+            """INSERT INTO review_history
+               (pending_review_id, action, before_payload, after_payload, note)
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                pending_review_id,
+                action,
+                _json_dump(before_payload) if before_payload is not None else "",
+                _json_dump(after_payload) if after_payload is not None else "",
+                note,
+            )
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def update_pending_review(review_id: int, status: str, review_note: str = "",
+                          approved_payload=None, edited_payload=None) -> dict | None:
+    conn = get_db()
+    try:
+        conn.execute(
+            """UPDATE pending_reviews
+               SET status = ?, review_note = ?, approved_payload = ?, edited_payload = ?,
+                   reviewed_at = datetime('now')
+               WHERE id = ?""",
+            (
+                status,
+                review_note,
+                _json_dump(approved_payload) if approved_payload is not None else "",
+                _json_dump(edited_payload) if edited_payload is not None else "",
+                review_id,
+            )
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM pending_reviews WHERE id = ?", (review_id,)).fetchone()
+        return _row_to_dict(row)
+    finally:
+        conn.close()
+
+
+def save_review_item(review_type: str, proposed_payload, diff_summary: str = "",
+                     source_snapshot_id: int | None = None, status: str = "pending") -> int:
+    return save_pending_review(
+        review_type=review_type,
+        proposed_payload=proposed_payload,
+        diff_summary=diff_summary,
+        source_snapshot_id=source_snapshot_id,
+        status=status,
+    )
+
+
+def get_review_item(review_id: int) -> dict | None:
+    return get_pending_review(review_id)
+
+
+def list_review_items(status: str | None = None, limit: int = 50, offset: int = 0) -> list[dict]:
+    return list_pending_reviews(status=status, limit=limit, offset=offset)
+
+
+def update_review_item(review_id: int, status: str, review_note: str = "",
+                       approved_payload=None, edited_payload=None) -> dict | None:
+    return update_pending_review(
+        review_id=review_id,
+        status=status,
+        review_note=review_note,
+        approved_payload=approved_payload,
+        edited_payload=edited_payload,
+    )
+
+
+def get_active_profile() -> dict:
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT * FROM active_profile WHERE id = 1").fetchone()
+        if row is None:
+            return {
+                "id": 1,
+                "profile_json": "{}",
+                "relationship_json": "{}",
+                "source_review_id": None,
+                "updated_at": None,
+            }
+        return dict(row)
+    finally:
+        conn.close()
+
+
+def upsert_active_profile(profile_json, relationship_json, source_review_id: int | None = None):
+    conn = get_db()
+    try:
+        conn.execute(
+            """INSERT INTO active_profile (id, profile_json, relationship_json, source_review_id, updated_at)
+               VALUES (1, ?, ?, ?, datetime('now'))
+               ON CONFLICT(id) DO UPDATE SET
+                 profile_json = excluded.profile_json,
+                 relationship_json = excluded.relationship_json,
+                 source_review_id = excluded.source_review_id,
+                 updated_at = datetime('now')""",
+            (
+                _json_dump(profile_json),
+                _json_dump(relationship_json),
+                source_review_id,
+            )
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def save_worker_run(worker_name: str = "memory_worker", run_mode: str = "manual",
+                    status: str = "queued", phase: str = "queued",
+                    message: str = "") -> int:
+    conn = get_db()
+    try:
+        cursor = conn.execute(
+            """INSERT INTO worker_runs
+               (worker_name, run_mode, status, phase, message)
+               VALUES (?, ?, ?, ?, ?)""",
+            (worker_name, run_mode, status, phase, message)
+        )
+        conn.commit()
+        return cursor.lastrowid
+    finally:
+        conn.close()
+
+
+def update_worker_run(run_id: int, **updates) -> dict | None:
+    allowed = {
+        "status", "phase", "message", "completed_at",
+        "token_input", "token_output", "token_total", "result_json", "error",
+    }
+    fields = []
+    params = []
+    for key, value in updates.items():
+        if key not in allowed:
+            continue
+        fields.append(f"{key} = ?")
+        if key == "result_json":
+            params.append(_json_dump(value))
+        else:
+            params.append(value)
+    if not fields:
+        return get_worker_run(run_id)
+    params.append(run_id)
+    conn = get_db()
+    try:
+        conn.execute(
+            f"UPDATE worker_runs SET {', '.join(fields)} WHERE id = ?",
+            params
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM worker_runs WHERE id = ?", (run_id,)).fetchone()
+        return _row_to_dict(row)
+    finally:
+        conn.close()
+
+
+def get_worker_run(run_id: int) -> dict | None:
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT * FROM worker_runs WHERE id = ?", (run_id,)).fetchone()
+        return _row_to_dict(row)
+    finally:
+        conn.close()
+
+
+def list_worker_runs(limit: int = 20, offset: int = 0) -> list[dict]:
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            """SELECT * FROM worker_runs
+               ORDER BY id DESC
+               LIMIT ? OFFSET ?""",
+            (limit, offset)
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_new_memory_stats() -> dict:
+    conn = get_db()
+    try:
+        slice_total = conn.execute("SELECT COUNT(*) AS c FROM memory_slices").fetchone()["c"]
+        slice_active = conn.execute(
+            "SELECT COUNT(*) AS c FROM memory_slices WHERE status = 'active'"
+        ).fetchone()["c"]
+        long_total = conn.execute("SELECT COUNT(*) AS c FROM long_term_memories").fetchone()["c"]
+        long_embedded = conn.execute(
+            "SELECT COUNT(*) AS c FROM long_term_memories WHERE has_embedding = 1"
+        ).fetchone()["c"]
+        diaries = conn.execute("SELECT COUNT(*) AS c FROM diary_entries").fetchone()["c"]
+        reviews_pending = conn.execute(
+            "SELECT COUNT(*) AS c FROM pending_reviews WHERE status = 'pending'"
+        ).fetchone()["c"]
+        return {
+            "slice_total": int(slice_total),
+            "slice_active": int(slice_active),
+            "long_term_total": int(long_total),
+            "long_term_embedded": int(long_embedded),
+            "diary_total": int(diaries),
+            "reviews_pending": int(reviews_pending),
+        }
     finally:
         conn.close()
 

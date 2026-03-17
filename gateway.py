@@ -37,7 +37,9 @@ from config import (
     CORS_ALLOWED_ORIGINS,
     GATEWAY_AUTH_TOKEN,
     HISTORY_SEARCH_LIMIT,
+    LONG_TERM_MEMORY_TOP_K,
     MAX_HISTORY_CHARS,
+    MEMORY_CONTEXT_RAW_LIMIT,
     MAX_NOTION_CHARS,
     PROVIDERS,
     RATE_LIMIT_RPD,
@@ -47,14 +49,18 @@ from config import (
     reload_providers,
 )
 from database import (
-    backup_database, build_pending_chunks, get_chunks_by_ids, get_neighbor_chunks,
-    get_recent_cards,
-    get_unembedded_chunks, init_db, mark_chunks_embedded, save_message,
+    append_review_history, backup_database, build_pending_chunks, get_chunks_by_ids, get_neighbor_chunks,
+    get_active_profile, get_new_memory_stats, get_pending_review, get_recent_messages,
+    get_worker_run,
+    list_diary_entries, list_long_term_memories, list_pending_reviews, list_worker_runs,
+    list_memory_slices, update_pending_review, upsert_active_profile,
+    get_unembedded_chunks, init_db, mark_chunks_embedded, save_message, save_worker_run,
     search_history, start_writer,
+    update_worker_run,
 )
 from embedding import (
     get_embedding, get_embedding_for_query, get_embeddings_batch,
-    vector_store, card_vector_store,
+    vector_store, card_vector_store, long_term_memory_vector_store,
 )
 from memory_cards import (
     derive_weekly_digests_from_cards,
@@ -79,12 +85,21 @@ except ImportError as _e:
         import json
         return json.dumps({"error": "calendar_tools not available"})
 try:
-    from memory_tools import MEMORY_TOOLS, execute_search_memory
+    from memory_tools import MEMORY_TOOLS, debug_search_memory, execute_search_memory
 except ImportError as _e:
     logging.getLogger(__name__).error(f"Failed to import memory_tools: {_e}")
     MEMORY_TOOLS = []
+    def debug_search_memory(query):
+        return {"error": "memory debug unavailable", "query": query}
     def execute_search_memory(query):
         return "记忆搜索功能暂时不可用。"
+from memory_pipeline import (
+    build_long_term_context,
+    build_slice_context,
+    get_context_ready_long_term_memories,
+    get_context_ready_slices,
+    process_memory_pipeline,
+)
 
 try:
     from lutopia_tools import LUTOPIA_TOOLS, execute_register_lutopia_agent, execute_publish_lutopia_post, execute_read_lutopia_posts, execute_read_post_detail, execute_reply_lutopia_post
@@ -408,55 +423,28 @@ def _limit_recent_messages(messages: list[dict], max_messages: int) -> list[dict
 
 def build_recent_context(model: str, exclude_conversation_id: str | None = None) -> str | None:
     """
-    Build the rolling-summary layer for the prompt.
-    Summary source is unified to the new memory-card pipeline:
-    recent daily cards + weekly digests derived from those cards.
-    Legacy daily_summary / weekly_summary tables are intentionally not read here.
+    Build the recent memory layer for the prompt.
+    New source of truth:
+      1. Active long-term memories
+      2. Up to 4 active memory slices
+    Legacy memory_cards / weekly digests are no longer used here.
     """
-    lines = []
     family = _model_family(model)
+    long_term_memories = get_context_ready_long_term_memories(limit=LONG_TERM_MEMORY_TOP_K)
+    slices = get_context_ready_slices(limit=config.MEMORY_CONTEXT_SLICE_LIMIT)
 
-    recent_cards = get_recent_cards(days=ROLLING_SUMMARY_DAYS)
-    if recent_cards:
-        seen_dates = set()
-        daily_cards = []
-        for card in recent_cards:
-            date = card.get("date", "?")
-            if date in seen_dates:
-                continue
-            seen_dates.add(date)
-            daily_cards.append(card)
-            if len(daily_cards) >= ROLLING_DAILY_CARD_LIMIT:
-                break
+    sections = []
+    long_term_text = build_long_term_context(long_term_memories)
+    if long_term_text:
+        sections.append("【长期记忆】\n" + long_term_text)
+    slice_text = build_slice_context(slices)
+    if slice_text:
+        sections.append("【最近记忆切片】\n" + slice_text)
 
-        for card in daily_cards:
-            date = card.get("date", "?")
-            summary = card.get("summary", "")
-            tags = card.get("tags", "")
-            ago = _days_ago(date)
-            tag_str = f" #{tags}" if tags else ""
-            lines.append(f"[{date} ({ago}){tag_str}]\n{summary}")
-
-        if len(lines) < ROLLING_SUMMARY_LIMIT:
-            older_cards = []
-            daily_dates = {c.get("date", "") for c in daily_cards}
-            for card in recent_cards:
-                if card.get("date", "") in daily_dates:
-                    continue
-                older_cards.append(card)
-            weekly_digests = derive_weekly_digests_from_cards(
-                older_cards,
-                max_weeks=ROLLING_WEEKLY_DIGEST_LIMIT,
-            )
-            for digest in reversed(weekly_digests):
-                lines.append(digest["summary"])
-                if len(lines) >= ROLLING_SUMMARY_LIMIT:
-                    break
-
-    if not lines:
+    if not sections:
         return None
 
-    content = "\n\n".join(lines)
+    content = "\n\n".join(sections)
     if len(content) > ROLLING_SUMMARY_MAX_CHARS:
         content = content[:ROLLING_SUMMARY_MAX_CHARS] + "\n...(truncated)"
 
@@ -1253,10 +1241,11 @@ def _trim_messages_to_fit(messages: list[dict], max_chars: int) -> list[dict]:
 def build_messages(incoming_messages: list[dict], model: str,
                    conversation_id: str | None = None) -> list[dict]:
     """
-    Build the final message list using a three-layer context model:
-    1. System prompt + rolling summaries + current time
-    2. Recent raw conversation window from the current chat
-    3. Long-term memory retrieval on demand (or auto-RAG for weak tool callers)
+    Build the final message list using the upgraded memory context model:
+    1. System prompt + approved profile + current time
+    2. Long-term memories + recent slices
+    3. Recent raw conversation window from the current chat
+    4. Long-term retrieval on demand for tool calling / weak tool callers
     """
     _t_build_start = time.time()
     system_prompt = load_system_prompt()
@@ -1277,7 +1266,9 @@ def build_messages(incoming_messages: list[dict], model: str,
 
     final_messages = []
 
-    # --- 1. Persona + recent summary + model-specific patch + current time ---
+    active_profile = get_active_profile() or {}
+
+    # --- 1. System prompt + approved profile + recent summary + model-specific patch + current time ---
     if system_prompt:
         if recent_ctx and "{{RECENT_SUMMARY}}" in system_prompt:
             summary_text = recent_ctx
@@ -1292,6 +1283,16 @@ def build_messages(incoming_messages: list[dict], model: str,
         weekdays = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
         now_str = now_bj.strftime("%Y年%-m月%-d日") + " " + weekdays[now_bj.weekday()] + " " + now_bj.strftime("%H:%M")
         time_line = f"\n\n【当前时间】{now_str}"
+        if active_profile:
+            profile_bits = []
+            profile_json = active_profile.get("profile_json") or "{}"
+            relationship_json = active_profile.get("relationship_json") or "{}"
+            if profile_json and profile_json != "{}":
+                profile_bits.append(f"【已审核用户画像】\n{profile_json}")
+            if relationship_json and relationship_json != "{}":
+                profile_bits.append(f"【已审核关系状态】\n{relationship_json}")
+            if profile_bits:
+                system_prompt = system_prompt + "\n\n" + "\n\n".join(profile_bits)
         final_messages.append({"role": "system", "content": system_prompt + patch + time_line})
 
     # --- Memory retrieval ---
@@ -1325,7 +1326,7 @@ def build_messages(incoming_messages: list[dict], model: str,
 
     # --- 2. Recent raw conversation window from current chat ---
     kelivo_msgs = [msg for msg in cleaned if msg["role"] != "system"]
-    kelivo_msgs = _limit_recent_messages(kelivo_msgs, RECENT_RAW_MAX_MESSAGES)
+    kelivo_msgs = _limit_recent_messages(kelivo_msgs, MEMORY_CONTEXT_RAW_LIMIT)
 
     prefix_chars = sum(_estimate_msg_chars(m) for m in final_messages)
     max_context = _model_max_context(model)
@@ -2015,13 +2016,284 @@ def stats():
         today_count = conn.execute(
             "SELECT COUNT(*) FROM messages WHERE created_at >= ?", (today,)
         ).fetchone()[0]
+        memory_stats = get_new_memory_stats()
         return jsonify({
             "total_messages": msg_count,
             "total_conversations": conv_count,
             "today_messages": today_count,
+            **memory_stats,
         })
     finally:
         conn.close()
+
+
+def _parse_json_text(value):
+    if not value:
+        return {}
+    if isinstance(value, (dict, list)):
+        return value
+    try:
+        return json.loads(value)
+    except Exception:
+        return {}
+
+
+@app.route("/admin/system/status", methods=["GET"])
+@require_auth
+def admin_system_status():
+    memory_stats = get_new_memory_stats()
+    worker_runs = list_worker_runs(limit=10, offset=0)
+    active_profile = get_active_profile()
+    return jsonify({
+        "memory": memory_stats,
+        "worker_runs": worker_runs,
+        "worker_config": {
+            "enabled": config.MEMORY_WORKER_ENABLED,
+            "provider": config.MEMORY_WORKER_PROVIDER,
+            "model": config.MEMORY_WORKER_MODEL,
+            "run_mode": config.MEMORY_WORKER_RUN_MODE,
+            "api_key_configured": bool(config.MEMORY_WORKER_API_KEY),
+        },
+        "vectors": {
+            "message_vectors": vector_store.size,
+            "card_vectors": card_vector_store.size,
+            "long_term_vectors": long_term_memory_vector_store.size,
+        },
+        "jobs": {
+            "cards": _get_card_rebuild_state(),
+            "vectors": _get_vector_rebuild_state(),
+        },
+        "active_profile": {
+            "profile_json": _parse_json_text(active_profile.get("profile_json")),
+            "relationship_json": _parse_json_text(active_profile.get("relationship_json")),
+            "updated_at": active_profile.get("updated_at"),
+            "source_review_id": active_profile.get("source_review_id"),
+        },
+    })
+
+
+@app.route("/admin/system/worker_runs", methods=["GET"])
+@require_auth
+def admin_worker_runs():
+    limit = max(1, min(int(request.args.get("limit", "20")), 100))
+    offset = max(0, int(request.args.get("offset", "0")))
+    runs = list_worker_runs(limit=limit, offset=offset)
+    return jsonify({"items": runs, "count": len(runs), "limit": limit, "offset": offset})
+
+
+@app.route("/admin/memory/worker/run", methods=["POST"])
+@require_auth
+def admin_run_memory_worker():
+    data = request.get_json(force=True) if request.is_json else {}
+    entry_date = (data.get("date") or time.strftime("%Y-%m-%d")).strip()
+    run_mode = (data.get("mode") or config.MEMORY_WORKER_RUN_MODE or "manual").strip() or "manual"
+
+    run_id = save_worker_run(
+        worker_name="memory_worker",
+        run_mode=run_mode,
+        status="running",
+        phase="queued",
+        message=f"queued pipeline for {entry_date}",
+    )
+
+    def _run():
+        usage_stats = {"token_input": 0, "token_output": 0, "token_total": 0}
+
+        def progress_cb(phase, **extra):
+            update_worker_run(
+                run_id,
+                phase=phase,
+                message=json.dumps(extra, ensure_ascii=False) if extra else phase,
+            )
+
+        try:
+            result = process_memory_pipeline(
+                entry_date=entry_date,
+                progress_cb=progress_cb,
+                worker_run_id=run_id,
+                usage_stats=usage_stats,
+            )
+            usage = result.get("usage", {})
+            update_worker_run(
+                run_id,
+                status="success",
+                phase="done",
+                message=f"pipeline finished for {entry_date}",
+                completed_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                token_input=int(usage.get("token_input", 0)),
+                token_output=int(usage.get("token_output", 0)),
+                token_total=int(usage.get("token_total", 0)),
+                result_json=result,
+            )
+        except Exception as exc:
+            logger.error("[MemoryWorker] admin pipeline run failed", exc_info=True)
+            update_worker_run(
+                run_id,
+                status="failed",
+                phase="error",
+                message=f"pipeline failed for {entry_date}",
+                completed_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                token_input=int(usage_stats.get("token_input", 0)),
+                token_output=int(usage_stats.get("token_output", 0)),
+                token_total=int(usage_stats.get("token_total", 0)),
+                error=str(exc),
+            )
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+
+    return jsonify({
+        "status": "started",
+        "run_id": run_id,
+        "date": entry_date,
+        "mode": run_mode,
+        "worker_enabled": config.MEMORY_WORKER_ENABLED,
+    })
+
+
+@app.route("/admin/memory/slices", methods=["GET"])
+@require_auth
+def admin_memory_slices():
+    limit = max(1, min(int(request.args.get("limit", "50")), 200))
+    offset = max(0, int(request.args.get("offset", "0")))
+    status = request.args.get("status")
+    slices = list_memory_slices(status=status, limit=limit, offset=offset)
+    return jsonify({"items": slices, "count": len(slices), "limit": limit, "offset": offset})
+
+
+@app.route("/admin/memory/long_term", methods=["GET"])
+@require_auth
+def admin_long_term_memories():
+    limit = max(1, min(int(request.args.get("limit", "50")), 200))
+    offset = max(0, int(request.args.get("offset", "0")))
+    status = request.args.get("status")
+    memories = list_long_term_memories(status=status, limit=limit, offset=offset)
+    return jsonify({"items": memories, "count": len(memories), "limit": limit, "offset": offset})
+
+
+@app.route("/admin/memory/diaries", methods=["GET"])
+@require_auth
+def admin_diaries():
+    limit = max(1, min(int(request.args.get("limit", "50")), 200))
+    offset = max(0, int(request.args.get("offset", "0")))
+    diaries = list_diary_entries(limit=limit, offset=offset)
+    return jsonify({"items": diaries, "count": len(diaries), "limit": limit, "offset": offset})
+
+
+@app.route("/admin/memory/debug_search", methods=["POST"])
+@require_auth
+def admin_memory_debug_search():
+    data = request.get_json(force=True) if request.is_json else {}
+    query = (data.get("query") or "").strip()
+    if not query:
+        return jsonify({"error": "query is required"}), 400
+    result = debug_search_memory(query)
+    return jsonify(result)
+
+
+@app.route("/admin/reviews", methods=["GET"])
+@require_auth
+def admin_reviews():
+    limit = max(1, min(int(request.args.get("limit", "50")), 200))
+    offset = max(0, int(request.args.get("offset", "0")))
+    status = request.args.get("status")
+    rows = list_pending_reviews(status=status, limit=limit, offset=offset)
+    items = []
+    for row in rows:
+        item = dict(row)
+        item["proposed_payload_json"] = _parse_json_text(item.get("proposed_payload"))
+        item["approved_payload_json"] = _parse_json_text(item.get("approved_payload"))
+        item["edited_payload_json"] = _parse_json_text(item.get("edited_payload"))
+        items.append(item)
+    return jsonify({"items": items, "count": len(items), "limit": limit, "offset": offset})
+
+
+@app.route("/admin/reviews/<int:review_id>", methods=["GET"])
+@require_auth
+def admin_review_detail(review_id: int):
+    row = get_pending_review(review_id)
+    if not row:
+        return jsonify({"error": "review not found"}), 404
+    row["proposed_payload_json"] = _parse_json_text(row.get("proposed_payload"))
+    row["approved_payload_json"] = _parse_json_text(row.get("approved_payload"))
+    row["edited_payload_json"] = _parse_json_text(row.get("edited_payload"))
+    return jsonify(row)
+
+
+def _apply_review_action(review_id: int, action: str):
+    review = get_pending_review(review_id)
+    if not review:
+        return jsonify({"error": "review not found"}), 404
+
+    data = request.get_json(force=True) if request.is_json else {}
+    note = data.get("note", "")
+    proposed = _parse_json_text(review.get("proposed_payload"))
+    payload = data.get("payload") or proposed
+
+    if action == "approve":
+        upsert_active_profile(
+            profile_json=payload.get("persona", {}),
+            relationship_json=payload.get("relationship", {}),
+            source_review_id=review_id,
+        )
+        updated = update_pending_review(
+            review_id,
+            status="approved",
+            review_note=note,
+            approved_payload=payload,
+        )
+    elif action == "edit":
+        upsert_active_profile(
+            profile_json=payload.get("persona", {}),
+            relationship_json=payload.get("relationship", {}),
+            source_review_id=review_id,
+        )
+        updated = update_pending_review(
+            review_id,
+            status="edited",
+            review_note=note,
+            approved_payload=payload,
+            edited_payload=payload,
+        )
+    elif action == "reject":
+        updated = update_pending_review(
+            review_id,
+            status="rejected",
+            review_note=note,
+        )
+    else:
+        return jsonify({"error": "unsupported action"}), 400
+
+    append_review_history(
+        pending_review_id=review_id,
+        action=action,
+        before_payload=proposed,
+        after_payload=payload if action in {"approve", "edit"} else {},
+        note=note,
+    )
+    if updated:
+        updated["proposed_payload_json"] = _parse_json_text(updated.get("proposed_payload"))
+        updated["approved_payload_json"] = _parse_json_text(updated.get("approved_payload"))
+        updated["edited_payload_json"] = _parse_json_text(updated.get("edited_payload"))
+    return jsonify(updated or {"status": "ok"})
+
+
+@app.route("/admin/reviews/<int:review_id>/approve", methods=["POST"])
+@require_auth
+def admin_review_approve(review_id: int):
+    return _apply_review_action(review_id, "approve")
+
+
+@app.route("/admin/reviews/<int:review_id>/edit", methods=["POST"])
+@require_auth
+def admin_review_edit(review_id: int):
+    return _apply_review_action(review_id, "edit")
+
+
+@app.route("/admin/reviews/<int:review_id>/reject", methods=["POST"])
+@require_auth
+def admin_review_reject(review_id: int):
+    return _apply_review_action(review_id, "reject")
 
 
 # ---------- Provider Hot-Reload ----------

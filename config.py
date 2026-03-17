@@ -90,6 +90,21 @@ MAX_NOTION_CHARS = int(os.getenv("MAX_NOTION_CHARS", "6000"))  # truncate Notion
 API_MAX_RETRIES = int(os.getenv("API_MAX_RETRIES", "3"))
 API_RETRY_BACKOFF = float(os.getenv("API_RETRY_BACKOFF", "1.5"))  # seconds
 
+# ---------- Memory Worker ----------
+MEMORY_WORKER_ENABLED = os.getenv("MEMORY_WORKER_ENABLED", "1").lower() in ("1", "true", "yes")
+MEMORY_WORKER_PROVIDER = os.getenv("MEMORY_WORKER_PROVIDER", "deepseek")
+MEMORY_WORKER_MODEL = os.getenv("MEMORY_WORKER_MODEL", "deepseek-chat")
+MEMORY_WORKER_API_KEY = os.getenv("MEMORY_WORKER_API_KEY", "")
+MEMORY_WORKER_BASE_URL = os.getenv("MEMORY_WORKER_BASE_URL", "https://api.deepseek.com/v1")
+MEMORY_WORKER_RUN_MODE = os.getenv("MEMORY_WORKER_RUN_MODE", "manual")
+MEMORY_DIARY_ENABLED = os.getenv("MEMORY_DIARY_ENABLED", "1").lower() in ("1", "true", "yes")
+MEMORY_PERSONA_ENABLED = os.getenv("MEMORY_PERSONA_ENABLED", "1").lower() in ("1", "true", "yes")
+MEMORY_SLICE_SIZE = int(os.getenv("MEMORY_SLICE_SIZE", "20"))
+MEMORY_SLICE_COMPACT_COUNT = int(os.getenv("MEMORY_SLICE_COMPACT_COUNT", "4"))
+MEMORY_CONTEXT_SLICE_LIMIT = int(os.getenv("MEMORY_CONTEXT_SLICE_LIMIT", "4"))
+MEMORY_CONTEXT_RAW_LIMIT = int(os.getenv("MEMORY_CONTEXT_RAW_LIMIT", "20"))
+LONG_TERM_MEMORY_TOP_K = int(os.getenv("LONG_TERM_MEMORY_TOP_K", "6"))
+
 
 def get_provider_for_model(model: str) -> dict | None:
     """

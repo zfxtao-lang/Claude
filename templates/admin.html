@@ -64,6 +64,32 @@
             <div id="jobSummary" class="list-block empty-state">还没有读取到数据。</div>
           </section>
         </div>
+
+        <div class="two-col">
+          <section class="card">
+            <div class="section-title">
+              <h3>系统状态面板</h3>
+              <button id="refreshSystemStatusBtn" class="ghost-btn">刷新系统状态</button>
+            </div>
+            <div class="form-grid">
+              <label>
+                <span>手动跑哪一天的总结 worker</span>
+                <input id="workerDateInput" type="date">
+              </label>
+            </div>
+            <div class="action-row">
+              <button id="runMemoryWorkerBtn" class="primary-btn">立即执行一次 memory worker</button>
+            </div>
+            <div id="systemStatusSummary" class="list-block empty-state">还没有读取到数据。</div>
+          </section>
+          <section class="card">
+            <div class="section-title">
+              <h3>后台 worker 运行记录</h3>
+              <button id="refreshWorkerRunsBtn" class="ghost-btn">刷新运行记录</button>
+            </div>
+            <div id="workerRunsList" class="list-block empty-state">还没有读取到数据。</div>
+          </section>
+        </div>
       </section>
 
       <section class="panel" id="memoryPanel">
@@ -141,6 +167,48 @@
           <h3>搜索结果</h3>
           <div id="cardSearchResults" class="card-list empty-state">还没有搜索。</div>
         </section>
+
+        <div class="two-col">
+          <section class="card">
+            <div class="section-title">
+              <h3>记忆检索调试</h3>
+              <button id="debugSearchBtn" class="ghost-btn">执行调试检索</button>
+            </div>
+            <div class="form-grid">
+              <label>
+                <span>输入要调试的记忆问题</span>
+                <input id="debugSearchInput" type="text" placeholder="例如：上次答应我的事是什么">
+              </label>
+            </div>
+            <div id="debugSearchResults" class="card-list empty-state">还没有执行调试。</div>
+          </section>
+          <section class="card">
+            <div class="section-title">
+              <h3>待审核画像区</h3>
+              <button id="refreshReviewsBtn" class="ghost-btn">刷新待审核列表</button>
+            </div>
+            <div id="reviewList" class="card-list empty-state">还没有读取到待审核内容。</div>
+          </section>
+        </div>
+
+        <div class="two-col">
+          <section class="card">
+            <div class="section-title">
+              <h3>肖珂日记与情绪趋势</h3>
+              <button id="refreshDiariesBtn" class="ghost-btn">刷新日记</button>
+            </div>
+            <div id="moodTrend" class="mini-summary empty-state">还没有读取到数据。</div>
+            <div id="diaryList" class="card-list empty-state">还没有读取到日记。</div>
+          </section>
+          <section class="card">
+            <div class="section-title">
+              <h3>记忆切片与长期记忆</h3>
+              <button id="refreshMemoryDataBtn" class="ghost-btn">刷新记忆数据</button>
+            </div>
+            <div id="sliceList" class="card-list empty-state">还没有读取到切片。</div>
+            <div id="longMemoryList" class="card-list empty-state">还没有读取到长期记忆。</div>
+          </section>
+        </div>
       </section>
 
       <section class="panel" id="vectorPanel">

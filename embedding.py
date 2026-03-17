@@ -297,6 +297,8 @@ class VectorStore:
 
 CARD_VECTOR_FILE = os.getenv("CARD_VECTOR_FILE", "card_vectors.npy")
 CARD_VECTOR_IDS_FILE = os.getenv("CARD_VECTOR_IDS_FILE", "card_vectors_ids.npy")
+LONG_TERM_VECTOR_FILE = os.getenv("LONG_TERM_VECTOR_FILE", "long_term_vectors.npy")
+LONG_TERM_VECTOR_IDS_FILE = os.getenv("LONG_TERM_VECTOR_IDS_FILE", "long_term_vectors_ids.npy")
 
 
 class CardVectorStore(VectorStore):
@@ -344,6 +346,56 @@ class CardVectorStore(VectorStore):
                 logger.warning(f"[CardVector] failed to remove card vector file: {path}")
 
 
+class LongTermMemoryVectorStore(VectorStore):
+    """Vector store specifically for long-term memories."""
+
+    def __init__(self):
+        super().__init__()
+
+    def _load(self):
+        if self._loaded:
+            return
+        with self._lock:
+            if self._loaded:
+                return
+            if os.path.exists(LONG_TERM_VECTOR_FILE) and os.path.exists(LONG_TERM_VECTOR_IDS_FILE):
+                try:
+                    self._vectors = np.load(LONG_TERM_VECTOR_FILE)
+                    self._chunk_ids = np.load(LONG_TERM_VECTOR_IDS_FILE)
+                    logger.info(
+                        f"[LongTermVector] loaded {len(self._chunk_ids)} long-term vectors from disk"
+                    )
+                except Exception:
+                    logger.error("[LongTermVector] failed to load long-term vectors", exc_info=True)
+                    self._vectors = None
+                    self._chunk_ids = None
+            else:
+                logger.info("[LongTermVector] no long-term vector files found, starting empty")
+            self._loaded = True
+
+    def save(self):
+        with self._lock:
+            if self._vectors is not None and len(self._vectors) > 0:
+                np.save(LONG_TERM_VECTOR_FILE, self._vectors)
+                np.save(LONG_TERM_VECTOR_IDS_FILE, self._chunk_ids)
+                logger.info(
+                    f"[LongTermVector] saved {len(self._chunk_ids)} long-term vectors to disk"
+                )
+
+    def clear(self):
+        with self._lock:
+            self._vectors = None
+            self._chunk_ids = None
+            self._loaded = True
+        for path in (LONG_TERM_VECTOR_FILE, LONG_TERM_VECTOR_IDS_FILE):
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except OSError:
+                logger.warning(f"[LongTermVector] failed to remove vector file: {path}")
+
+
 # Global instances
 vector_store = VectorStore()
 card_vector_store = CardVectorStore()
+long_term_memory_vector_store = LongTermMemoryVectorStore()
