@@ -52,8 +52,9 @@ from database import (
     append_review_history, backup_database, build_pending_chunks, get_chunks_by_ids, get_neighbor_chunks,
     get_active_profile, get_new_memory_stats, get_pending_review, get_recent_messages,
     get_worker_run,
-    list_diary_entries, list_long_term_memories, list_pending_reviews, list_worker_runs,
-    list_memory_slices, update_pending_review, upsert_active_profile,
+    list_diary_entries, list_long_term_memories, list_memory_cards_admin, list_pending_reviews,
+    list_worker_runs,
+    list_memory_slices, count_memory_slices, update_pending_review, upsert_active_profile,
     get_unembedded_chunks, init_db, mark_chunks_embedded, save_message, save_worker_run,
     search_history, start_writer,
     update_worker_run,
@@ -539,6 +540,31 @@ def require_auth(f):
     return decorated
 
 
+def require_chat_completions_auth(f):
+    """Like require_auth, but also accepts GATEWAY_API_KEY for /v1/chat/completions only."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if request.method == "OPTIONS":
+            return f(*args, **kwargs)
+        api_key = (os.getenv("GATEWAY_API_KEY") or "").strip()
+        auth_tok = (GATEWAY_AUTH_TOKEN or "").strip()
+        auth = request.headers.get("Authorization", "")
+        token = auth[7:].strip() if auth.startswith("Bearer ") else ""
+
+        if not auth_tok and not api_key:
+            if _is_local_request():
+                return f(*args, **kwargs)
+            logger.warning("[Auth] chat: GATEWAY_AUTH_TOKEN and GATEWAY_API_KEY both unset")
+            return jsonify({"error": "Gateway auth token is not configured"}), 503
+
+        if auth_tok and token == auth_tok:
+            return f(*args, **kwargs)
+        if api_key and token == api_key:
+            return f(*args, **kwargs)
+        return jsonify({"error": "Unauthorized"}), 401
+    return decorated
+
+
 # ---------- CORS ----------
 @app.after_request
 def add_cors_headers(response):
@@ -811,6 +837,46 @@ def _strip_inner_monologue(text: str) -> str:
     return _RE_INNER_MONO.sub("", text).strip()
 
 
+# ---------- DeepSeek Reasoner / multimodal text coercion (gateway_backup parity) ----------
+def _coerce_text(val) -> str:
+    """Normalize content/reasoning fields from OpenAI-compatible JSON (str, list, or None)."""
+    if val is None:
+        return ""
+    if isinstance(val, str):
+        return val
+    if isinstance(val, list):
+        parts: list[str] = []
+        for p in val:
+            if isinstance(p, str):
+                parts.append(p)
+            elif isinstance(p, dict):
+                if p.get("type") == "text" and "text" in p:
+                    parts.append(str(p.get("text", "")))
+                elif "text" in p:
+                    parts.append(str(p.get("text", "")))
+        return "".join(parts)
+    return str(val)
+
+
+def _msg_reasoning_and_content_from_dict(message: dict) -> tuple[str, str]:
+    """Extract reasoning_content + content from an API message dict (HTTP JSON, not SDK)."""
+    if not message:
+        return "", ""
+    reasoning = message.get("reasoning_content")
+    content = message.get("content")
+    return _coerce_text(reasoning), _coerce_text(content)
+
+
+def _assistant_text_from_api_message_dict(message: dict) -> str:
+    """
+    Non-streaming: merge 思维链 + 正文 into one visible reply (DeepSeek reasoner 等).
+    Mirrors gateway_backup._assistant_text_from_message for dict payloads.
+    """
+    rs, cs = _msg_reasoning_and_content_from_dict(message)
+    parts = [p for p in (rs.strip(), cs.strip()) if p]
+    return "\n\n".join(parts) if parts else ""
+
+
 def _model_specific_patch(model: str) -> str:
     """Return model-specific system prompt patch. Only the matching model sees its patch."""
     family = _model_family(model)
@@ -885,6 +951,10 @@ def call_provider(provider_cfg: dict, messages: list[dict],
     Call any OpenAI-compatible API.
     Works for OpenRouter, DeepSeek, Zhipu, Alibaba - they all use /chat/completions.
     Uses persistent session with connection pooling for stability.
+
+    Official-direct routing (gateway_backup._pick_chat_client parity) is expressed in
+    providers.json + get_provider_for_model(): e.g. deepseek-chat → DeepSeek base_url,
+    glm-* → Zhipu, qwen* → Dashscope, others → OpenRouter — without duplicating a second SDK path.
     """
     url = f"{provider_cfg['base_url']}/chat/completions"
     headers = {
@@ -1518,6 +1588,11 @@ def _tool_call_loop(provider_cfg, messages, model, extra, max_rounds):
             logger.info(f"[Tools] round {round_idx}: final text response "
                         f"(finish_reason={finish_reason}, "
                         f"content_preview={str(content)[:100]})")
+            # Merge DeepSeek-style reasoning_content + content for client + DB (gateway_backup parity)
+            merged = _assistant_text_from_api_message_dict(message)
+            if merged:
+                message["content"] = _strip_inner_monologue(merged)
+                message.pop("reasoning_content", None)
             # Strip any leftover tool_calls from the final response
             if "tool_calls" in message:
                 del message["tool_calls"]
@@ -1620,7 +1695,7 @@ def _fake_stream_response(result_json):
 
 # ---------- Main Chat Endpoint ----------
 @app.route("/v1/chat/completions", methods=["POST", "OPTIONS"])
-@require_auth
+@require_chat_completions_auth
 def chat_completions():
     if request.method == "OPTIONS":
         return "", 204
@@ -1832,6 +1907,14 @@ def chat_completions():
                                         logger.info(f"[Perf] first content token: {time.time()-_t_first_token:.2f}s after stream start")
                                         _first_token_logged = True
                                     assistant_text.append(delta["content"])
+                                rc = delta.get("reasoning_content")
+                                if rc is not None and rc != "":
+                                    piece = rc if isinstance(rc, str) else _coerce_text(rc)
+                                    if piece:
+                                        if not _first_token_logged:
+                                            logger.info(f"[Perf] first stream token: {time.time()-_t_first_token:.2f}s after stream start")
+                                            _first_token_logged = True
+                                        assistant_text.append(piece)
                             except (json.JSONDecodeError, IndexError):
                                 pass
                         # Forward every line (including [DONE]) to client immediately
@@ -1841,7 +1924,8 @@ def chat_completions():
                     full_text = "".join(t for t in assistant_text if t is not None)
                     logger.info(f"[Perf] stream complete: {time.time()-_t_first_token:.2f}s total, {len(full_text)} chars")
                     if full_text.strip():
-                        save_message(conversation_id, "assistant", full_text,
+                        to_save = _strip_inner_monologue(full_text)
+                        save_message(conversation_id, "assistant", to_save,
                                     model, provider_name)
                     else:
                         logger.warning("Empty assistant response in stream (passthrough)")
@@ -1863,15 +1947,18 @@ def chat_completions():
     logger.info(f"Raw API response keys: {list(raw_json.keys())}")
     result = raw_json
 
-    # Extract and save assistant reply
+    # Extract and save assistant reply (merge reasoning_content + content for DeepSeek reasoner)
     assistant_content = ""
     choices = result.get("choices", [])
     if choices:
-        assistant_content = choices[0].get("message", {}).get("content", "")
+        msg = choices[0].get("message") or {}
+        merged = _assistant_text_from_api_message_dict(msg)
+        assistant_content = merged
 
     if assistant_content:
         clean_content = _strip_inner_monologue(assistant_content)
         result["choices"][0]["message"]["content"] = clean_content
+        result["choices"][0]["message"].pop("reasoning_content", None)
         tokens_in = result.get("usage", {}).get("prompt_tokens", 0)
         tokens_out = result.get("usage", {}).get("completion_tokens", 0)
         save_message(conversation_id, "assistant", clean_content,
@@ -2158,7 +2245,34 @@ def admin_memory_slices():
     offset = max(0, int(request.args.get("offset", "0")))
     status = request.args.get("status")
     slices = list_memory_slices(status=status, limit=limit, offset=offset)
-    return jsonify({"items": slices, "count": len(slices), "limit": limit, "offset": offset})
+    total = count_memory_slices(status=status)
+    return jsonify(
+        {
+            "items": slices,
+            "count": len(slices),
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        }
+    )
+
+
+@app.route("/admin/memory/memory_cards", methods=["GET"])
+@require_auth
+def admin_memory_memory_cards():
+    limit = max(1, min(int(request.args.get("limit", "200")), 1000))
+    offset = max(0, int(request.args.get("offset", "0")))
+    date = (request.args.get("date") or "").strip() or None
+    items, total = list_memory_cards_admin(limit=limit, offset=offset, date=date)
+    return jsonify(
+        {
+            "items": items,
+            "count": len(items),
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        }
+    )
 
 
 @app.route("/admin/memory/long_term", methods=["GET"])

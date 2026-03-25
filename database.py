@@ -178,10 +178,20 @@ def init_db():
             message_count INTEGER NOT NULL DEFAULT 0,
             summary TEXT NOT NULL,
             tags TEXT DEFAULT '',
-            status TEXT NOT NULL DEFAULT 'active',
+            status TEXT NOT NULL DEFAULT 'in_pool',
             source_long_memory_id INTEGER,
             has_embedding INTEGER NOT NULL DEFAULT 0,
             meta_json TEXT DEFAULT '{}',
+            -- Raw original slice pool fields (append-only; keep old summary for compatibility)
+            content TEXT,
+            speaker TEXT,
+            type TEXT,
+            signals TEXT,
+            context_anchor TEXT,
+            context TEXT,
+            first_impact INTEGER DEFAULT 0,
+            hits INTEGER DEFAULT 0,
+            score REAL DEFAULT 0.0,
             created_at TEXT DEFAULT (datetime('now')),
             updated_at TEXT DEFAULT (datetime('now'))
         );
@@ -192,8 +202,6 @@ def init_db():
             ON memory_slices(msg_id_start, msg_id_end);
         CREATE INDEX IF NOT EXISTS idx_memory_slices_source_long_memory
             ON memory_slices(source_long_memory_id);
-        CREATE UNIQUE INDEX IF NOT EXISTS uq_memory_slices_msg_range
-            ON memory_slices(msg_id_start, msg_id_end);
 
         CREATE TABLE IF NOT EXISTS long_term_memories (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -295,6 +303,19 @@ def init_db():
             updated_at TEXT DEFAULT (datetime('now'))
         );
 
+        CREATE TABLE IF NOT EXISTS core_facts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL DEFAULT '',
+            content TEXT NOT NULL DEFAULT '',
+            fact_type TEXT DEFAULT 'core',
+            sort_order INTEGER DEFAULT 0,
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_core_facts_sort
+            ON core_facts(sort_order, id);
+
         CREATE TABLE IF NOT EXISTS review_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             pending_review_id INTEGER NOT NULL,
@@ -332,6 +353,183 @@ def init_db():
     # --- Migrate legacy chat_history table if it exists ---
     if _table_exists(conn, "chat_history"):
         _migrate_chat_history(conn)
+
+    # --- Schema migration: add thought column if absent ---
+    try:
+        conn.execute("ALTER TABLE messages ADD COLUMN thought TEXT DEFAULT ''")
+        conn.commit()
+        logger.info("Migration: added 'thought' column to messages table")
+    except Exception:
+        pass  # Column already exists — safe to ignore
+
+    # --- Schema migration: memory_slices raw-slice pool extensions (append-only) ---
+    # Keep existing columns (e.g. summary/status) intact for backward compatibility.
+    #
+    # Note:
+    # - `status` already exists in this schema. We still try the ADD COLUMN to match
+    #   the requested shape, but we swallow the "duplicate column" error.
+    # - New columns are allowed to be NULL when older pipelines haven't populated them.
+    def _try_add_memory_slice_col(ddl: str) -> None:
+        try:
+            conn.execute(ddl)
+            conn.commit()
+        except Exception:
+            # Column already exists or SQLite can't apply this exact DDL — safe to ignore.
+            pass
+
+    _try_add_memory_slice_col("ALTER TABLE memory_slices ADD COLUMN content TEXT")
+    _try_add_memory_slice_col("ALTER TABLE memory_slices ADD COLUMN speaker TEXT")
+    _try_add_memory_slice_col("ALTER TABLE memory_slices ADD COLUMN type TEXT")
+    _try_add_memory_slice_col("ALTER TABLE memory_slices ADD COLUMN signals TEXT")
+    _try_add_memory_slice_col("ALTER TABLE memory_slices ADD COLUMN context_anchor TEXT")
+    _try_add_memory_slice_col("ALTER TABLE memory_slices ADD COLUMN context TEXT")
+    _try_add_memory_slice_col("ALTER TABLE memory_slices ADD COLUMN first_impact INTEGER DEFAULT 0")
+    _try_add_memory_slice_col("ALTER TABLE memory_slices ADD COLUMN hits INTEGER DEFAULT 0")
+    _try_add_memory_slice_col("ALTER TABLE memory_slices ADD COLUMN score REAL DEFAULT 0.0")
+    _try_add_memory_slice_col("ALTER TABLE memory_slices ADD COLUMN status TEXT DEFAULT 'in_pool'")
+
+    # Remove legacy UNIQUE(msg_id_start, msg_id_end) constraint if it exists.
+    # SQLite doesn't support ALTER TABLE DROP CONSTRAINT directly, so we rebuild.
+    def _index_exists(index_name: str) -> bool:
+        row = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name=?",
+            (index_name,),
+        ).fetchone()
+        return row is not None
+
+    if _index_exists("uq_memory_slices_msg_range"):
+        old_table = "memory_slices_old"
+        logger.info("[DB] Rebuilding memory_slices to remove UNIQUE(msg_id_start,msg_id_end)")
+        # Drop old indexes by name to avoid IF NOT EXISTS skipping creation
+        # on the newly recreated table.
+        for idx_name in (
+            "uq_memory_slices_msg_range",
+            "idx_memory_slices_status",
+            "idx_memory_slices_msg_range",
+            "idx_memory_slices_source_long_memory",
+        ):
+            try:
+                conn.execute(f"DROP INDEX IF EXISTS {idx_name}")
+            except Exception:
+                pass
+        conn.execute(f"ALTER TABLE memory_slices RENAME TO {old_table}")
+
+        # Recreate table without the unique constraint.
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS memory_slices (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id TEXT NOT NULL DEFAULT '',
+                conversation_ids TEXT NOT NULL DEFAULT '',
+                slice_index INTEGER NOT NULL DEFAULT 0,
+                msg_id_start INTEGER NOT NULL,
+                msg_id_end INTEGER NOT NULL,
+                message_count INTEGER NOT NULL DEFAULT 0,
+                summary TEXT NOT NULL,
+                tags TEXT DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'in_pool',
+                source_long_memory_id INTEGER,
+                has_embedding INTEGER NOT NULL DEFAULT 0,
+                meta_json TEXT DEFAULT '{}',
+                content TEXT,
+                speaker TEXT,
+                type TEXT,
+                signals TEXT,
+                context_anchor TEXT,
+                context TEXT,
+                first_impact INTEGER DEFAULT 0,
+                hits INTEGER DEFAULT 0,
+                score REAL DEFAULT 0.0,
+                created_at TEXT DEFAULT (datetime('now')),
+                updated_at TEXT DEFAULT (datetime('now'))
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_memory_slices_status
+                ON memory_slices(status, id);
+            CREATE INDEX IF NOT EXISTS idx_memory_slices_msg_range
+                ON memory_slices(msg_id_start, msg_id_end);
+            CREATE INDEX IF NOT EXISTS idx_memory_slices_source_long_memory
+                ON memory_slices(source_long_memory_id);
+        """)
+
+        # Copy overlapping columns. For missing new columns, use defaults.
+        new_cols = [
+            "id",
+            "conversation_id",
+            "conversation_ids",
+            "slice_index",
+            "msg_id_start",
+            "msg_id_end",
+            "message_count",
+            "summary",
+            "tags",
+            "status",
+            "source_long_memory_id",
+            "has_embedding",
+            "meta_json",
+            "content",
+            "speaker",
+            "type",
+            "signals",
+            "context_anchor",
+            "context",
+            "first_impact",
+            "hits",
+            "score",
+            "created_at",
+            "updated_at",
+        ]
+        old_cols = set(_get_table_columns(conn, old_table))
+        default_expr: dict[str, str] = {
+            "content": "NULL",
+            "speaker": "NULL",
+            "type": "NULL",
+            "signals": "NULL",
+            "context_anchor": "NULL",
+            "context": "NULL",
+            "first_impact": "0",
+            "hits": "0",
+            "score": "0.0",
+            "status": "'in_pool'",
+        }
+        insert_cols = ", ".join(new_cols)
+        select_exprs = []
+        for col in new_cols:
+            if col in old_cols:
+                select_exprs.append(col)
+            else:
+                select_exprs.append(default_expr.get(col, "NULL"))
+        select_list = ", ".join(select_exprs)
+
+        conn.execute(
+            f"INSERT INTO memory_slices ({insert_cols}) "
+            f"SELECT {select_list} FROM {old_table}"
+        )
+        conn.execute(f"DROP TABLE {old_table}")
+        conn.commit()
+
+    # Alias view for tools/docs expecting a table named daily_diary (data lives in diary_entries).
+    try:
+        conn.execute(
+            """
+            CREATE VIEW IF NOT EXISTS daily_diary AS
+            SELECT id,
+                   entry_date AS date,
+                   title,
+                   content,
+                   mood_score,
+                   mood_label,
+                   source_msg_id_start,
+                   source_msg_id_end,
+                   source_slice_ids,
+                   worker_run_id,
+                   created_at,
+                   updated_at
+            FROM diary_entries
+            """
+        )
+        conn.commit()
+    except Exception as exc:
+        logger.debug("daily_diary view create skipped: %s", exc)
 
     conn.close()
 
@@ -488,12 +686,14 @@ atexit.register(stop_writer)
 
 def save_message(conversation_id: str, role: str, content: str,
                  model: str = "", provider: str = "",
-                 tokens_in: int = 0, tokens_out: int = 0):
+                 tokens_in: int = 0, tokens_out: int = 0,
+                 thought: str = ""):
     """Enqueue a message for async writing (non-blocking)."""
     _write_queue.put({
         "conversation_id": conversation_id,
         "role": role,
         "content": content,
+        "thought": thought,
         "model": model,
         "provider": provider,
         "tokens_in": tokens_in,
@@ -503,7 +703,8 @@ def save_message(conversation_id: str, role: str, content: str,
 
 def _do_save_message(conversation_id: str, role: str, content: str,
                      model: str = "", provider: str = "",
-                     tokens_in: int = 0, tokens_out: int = 0):
+                     tokens_in: int = 0, tokens_out: int = 0,
+                     thought: str = ""):
     """Actually persist a message to SQLite (called from writer thread)."""
     conn = get_db()
     try:
@@ -525,9 +726,9 @@ def _do_save_message(conversation_id: str, role: str, content: str,
 
         conn.execute(
             """INSERT INTO messages
-               (conversation_id, role, content, model, provider, tokens_in, tokens_out)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (conversation_id, role, content, model, provider, tokens_in, tokens_out)
+               (conversation_id, role, content, thought, model, provider, tokens_in, tokens_out)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (conversation_id, role, content, thought or "", model, provider, tokens_in, tokens_out)
         )
         conn.execute(
             "UPDATE conversations SET updated_at = datetime('now'), model = ? WHERE id = ?",
@@ -710,14 +911,15 @@ def search_history(query: str, limit: int = 5, max_chars: int = 4000,
 
 
 def get_recent_messages(conversation_id: str, limit: int = 10) -> list[dict]:
-    """Get recent messages for a conversation (from our DB, not Kelivo)."""
+    """Get recent messages for a conversation (from our DB, not Kelivo). Chronological order."""
     conn = get_db()
     try:
         rows = conn.execute(
-            """SELECT role, content, created_at FROM messages
+            """SELECT id, role, content, created_at FROM messages
                WHERE conversation_id = ?
-               ORDER BY created_at DESC LIMIT ?""",
-            (conversation_id, limit)
+               ORDER BY created_at DESC, id DESC
+               LIMIT ?""",
+            (conversation_id, limit),
         ).fetchall()
         return [dict(r) for r in reversed(rows)]
     finally:
@@ -1022,17 +1224,59 @@ def save_memory_card(date: str, summary: str, tags: str = "",
         conn.close()
 
 
-def get_cards_by_date(date: str) -> list[dict]:
-    """Get all memory cards for a specific date."""
+def get_memory_cards_by_date(date: str) -> list[dict]:
+    """Get all legacy memory_cards rows for a specific date (embedding pipeline)."""
     conn = get_db()
     try:
         rows = conn.execute(
             "SELECT * FROM memory_cards WHERE date = ? ORDER BY id",
             (date,)
         ).fetchall()
-        return [dict(r) for r in rows]
+        result = [dict(r) for r in rows]
+        _enrich_cards_source_dates(result)
+        return result
     finally:
         conn.close()
+
+
+def get_diary_entries_by_date(date: str) -> list[dict]:
+    """Get diary_entries for admin list filter (one row per day typically)."""
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            """SELECT * FROM diary_entries
+               WHERE entry_date = ?
+               ORDER BY id DESC""",
+            (date,),
+        ).fetchall()
+        result = [_normalize_diary_entry(dict(r)) for r in rows]
+        _enrich_diary_source_dates(result)
+        return result
+    finally:
+        conn.close()
+
+
+def _normalize_diary_entry(row: dict) -> dict:
+    """Alias entry_date as date for API consumers."""
+    d = dict(row)
+    ed = d.get("entry_date")
+    if ed:
+        d["date"] = ed
+    return d
+
+
+def _enrich_diary_source_dates(rows: list[dict]) -> None:
+    """Add source_date_start/end from message range for diary rows."""
+    for d in rows:
+        start_id = int(d.get("source_msg_id_start", 0) or 0)
+        end_id = int(d.get("source_msg_id_end", 0) or 0)
+        if start_id and end_id:
+            min_d, max_d = get_message_date_range(start_id, end_id)
+            d["source_date_start"] = min_d
+            d["source_date_end"] = max_d
+        else:
+            d["source_date_start"] = ""
+            d["source_date_end"] = ""
 
 
 def get_unembedded_cards(limit: int = 50) -> list[dict]:
@@ -1076,35 +1320,53 @@ def get_cards_by_ids(card_ids: list[int]) -> list[dict]:
             f"SELECT * FROM memory_cards WHERE id IN ({placeholders})",
             card_ids
         ).fetchall()
-        id_to_row = {dict(r)["id"]: dict(r) for r in rows}
-        return [id_to_row[cid] for cid in card_ids if cid in id_to_row]
+        result = [dict(r) for r in rows]
+        id_to_row = {r["id"]: r for r in result}
+        ordered = [id_to_row[cid] for cid in card_ids if cid in id_to_row]
+        _enrich_cards_source_dates(ordered)
+        return ordered
     finally:
         conn.close()
 
 
 def get_all_cards() -> list[dict]:
-    """Get all memory cards (for full rebuild)."""
+    """Lightweight diary list for admin (diary_entries)."""
     conn = get_db()
     try:
         rows = conn.execute(
-            "SELECT id, summary FROM memory_cards ORDER BY id"
+            """SELECT id, entry_date, title, content, mood_score, mood_label
+               FROM diary_entries
+               ORDER BY entry_date DESC, id DESC"""
         ).fetchall()
-        return [dict(r) for r in rows]
+        return [_normalize_diary_entry(dict(r)) for r in rows]
     finally:
         conn.close()
 
 
+def _enrich_cards_source_dates(cards: list[dict]) -> None:
+    """Add source_date_start, source_date_end from message range for each card."""
+    for c in cards:
+        start_id = int(c.get("msg_id_start", 0) or 0)
+        end_id = int(c.get("msg_id_end", 0) or 0)
+        if start_id and end_id:
+            min_d, max_d = get_message_date_range(start_id, end_id)
+            c["source_date_start"] = min_d
+            c["source_date_end"] = max_d
+        else:
+            c["source_date_start"] = ""
+            c["source_date_end"] = ""
+
+
 def get_all_cards_full() -> list[dict]:
-    """Get full memory card records ordered by date then id."""
+    """Full diary_entries for admin UI, newest first."""
     conn = get_db()
     try:
         rows = conn.execute(
-            """SELECT id, date, summary, tags, conversation_ids,
-                      msg_id_start, msg_id_end, has_embedding, created_at
-               FROM memory_cards
-               ORDER BY date, id"""
+            "SELECT * FROM diary_entries ORDER BY entry_date DESC, id DESC"
         ).fetchall()
-        return [dict(r) for r in rows]
+        result = [_normalize_diary_entry(dict(r)) for r in rows]
+        _enrich_diary_source_dates(result)
+        return result
     finally:
         conn.close()
 
@@ -1114,7 +1376,19 @@ def export_memory_cards_backup(label: str | None = None) -> str:
     os.makedirs(DB_BACKUP_DIR, exist_ok=True)
     stamp = label or datetime.now().strftime("%Y%m%d_%H%M%S")
     dest = os.path.join(DB_BACKUP_DIR, f"memory_cards_{stamp}.json")
-    cards = get_all_cards_full()
+    cards: list[dict] = []
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            """SELECT id, date, summary, tags, conversation_ids,
+                      msg_id_start, msg_id_end, has_embedding, created_at
+               FROM memory_cards
+               ORDER BY date, id"""
+        ).fetchall()
+        cards = [dict(r) for r in rows]
+        _enrich_cards_source_dates(cards)
+    finally:
+        conn.close()
     with open(dest, "w", encoding="utf-8") as f:
         json.dump(cards, f, ensure_ascii=False, indent=2)
     return dest
@@ -1177,6 +1451,80 @@ def get_recent_cards(days: int = 3) -> list[dict]:
         conn.close()
 
 
+def get_recent_memory_cards_limit(limit: int = 5) -> list[dict]:
+    """Newest rows from memory_cards only (embedding / daily card summaries)."""
+    if limit <= 0:
+        return []
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            """SELECT id, date, summary, tags, conversation_ids, msg_id_start, msg_id_end,
+                      has_embedding, created_at
+               FROM memory_cards
+               ORDER BY date DESC, id DESC
+               LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def list_memory_cards_admin(
+    limit: int = 200,
+    offset: int = 0,
+    date: str | None = None,
+) -> tuple[list[dict], int]:
+    """Paginated memory_cards for admin UI (distinct from diary_entries)."""
+    conn = get_db()
+    try:
+        if date:
+            total = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM memory_cards WHERE date = ?",
+                    (date,),
+                ).fetchone()[0]
+            )
+            rows = conn.execute(
+                """SELECT id, date, summary, tags, conversation_ids,
+                          msg_id_start, msg_id_end, has_embedding, created_at
+                   FROM memory_cards WHERE date = ?
+                   ORDER BY id DESC LIMIT ? OFFSET ?""",
+                (date, limit, offset),
+            ).fetchall()
+        else:
+            total = int(conn.execute("SELECT COUNT(*) FROM memory_cards").fetchone()[0])
+            rows = conn.execute(
+                """SELECT id, date, summary, tags, conversation_ids,
+                          msg_id_start, msg_id_end, has_embedding, created_at
+                   FROM memory_cards
+                   ORDER BY date DESC, id DESC
+                   LIMIT ? OFFSET ?""",
+                (limit, offset),
+            ).fetchall()
+        return [dict(r) for r in rows], total
+    finally:
+        conn.close()
+
+
+def get_recent_daily_summaries(limit: int = 14) -> list[dict]:
+    """Newest rows from daily_summary (legacy daily rollup table)."""
+    if limit <= 0:
+        return []
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            """SELECT date, summary, message_count, created_at
+               FROM daily_summary
+               ORDER BY date DESC
+               LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
 def get_recent_cross_window_messages(limit: int = 30,
                                      exclude_conversation_id: str | None = None) -> list[dict]:
     """
@@ -1203,7 +1551,7 @@ def get_recent_cross_window_messages(limit: int = 30,
 
 
 def get_card_count() -> dict:
-    """Get memory card statistics."""
+    """Memory card (vector pipeline) + diary entry counts."""
     conn = get_db()
     try:
         total = conn.execute("SELECT COUNT(*) FROM memory_cards").fetchone()[0]
@@ -1213,7 +1561,15 @@ def get_card_count() -> dict:
         dates = conn.execute(
             "SELECT COUNT(DISTINCT date) FROM memory_cards"
         ).fetchone()[0]
-        return {"total": total, "embedded": embedded, "dates": dates}
+        diary_entries_total = conn.execute(
+            "SELECT COUNT(*) FROM diary_entries"
+        ).fetchone()[0]
+        return {
+            "total": total,
+            "embedded": embedded,
+            "dates": dates,
+            "diary_entries_total": diary_entries_total,
+        }
     finally:
         conn.close()
 
@@ -1251,17 +1607,28 @@ def get_next_memory_slice_index() -> int:
 
 
 def get_unsliced_messages(limit: int = 500) -> list[dict]:
+    """
+    Messages not yet covered by memory_slices, ordered by id.
+
+    Uses msg_id monotonic cursor (MAX(msg_id_end)) so rows that share the same
+    second-level created_at as the last sliced message are not skipped — the
+    previous created_at > T filter could exclude them forever.
+    """
     conn = get_db()
     try:
-        last_id = get_last_sliced_message_id()
+        row = conn.execute(
+            "SELECT COALESCE(MAX(msg_id_end), 0) AS max_id FROM memory_slices"
+        ).fetchone()
+        last_id = int(row["max_id"] if row and row["max_id"] is not None else 0)
+
         rows = conn.execute(
             """SELECT id, conversation_id, role, content, model, provider, created_at
                FROM messages
                WHERE id > ?
                  AND content IS NOT NULL AND trim(content) != ''
-               ORDER BY id
+               ORDER BY id ASC
                LIMIT ?""",
-            (last_id, limit)
+            (last_id, limit),
         ).fetchall()
         return [dict(r) for r in rows]
     finally:
@@ -1289,7 +1656,7 @@ def get_memory_slices_overlapping_range(msg_id_start: int, msg_id_end: int,
     try:
         rows = conn.execute(
             """SELECT * FROM memory_slices
-               WHERE status = 'active'
+               WHERE status IN ('active', 'in_pool', 'promoted')
                  AND msg_id_end >= ?
                  AND msg_id_start <= ?
                ORDER BY msg_id_end DESC
@@ -1301,25 +1668,53 @@ def get_memory_slices_overlapping_range(msg_id_start: int, msg_id_end: int,
         conn.close()
 
 
-def save_memory_slice(conversation_id: str, slice_index: int, msg_id_start: int,
-                      msg_id_end: int, message_count: int, summary: str,
-                      tags: str = "", conversation_ids: str = "",
-                      status: str = "active", source_long_memory_id: int | None = None,
-                      has_embedding: int = 0, meta_json=None) -> int:
-    conn = get_db()
+def save_memory_slice(
+    conversation_id: str,
+    slice_index: int,
+    msg_id_start: int,
+    msg_id_end: int,
+    message_count: int,
+    summary: str,
+    tags: str = "",
+    conversation_ids: str = "",
+    status: str = "in_pool",
+    source_long_memory_id: int | None = None,
+    has_embedding: int = 0,
+    meta_json=None,
+    # Raw-slice delayed pool fields (append-only; keep old summary for compatibility)
+    content: str | None = None,
+    speaker: str | None = None,
+    slice_type: str | None = None,
+    signals: str | None = None,
+    context_anchor: str | None = None,
+    context: str | None = None,
+    first_impact: int | bool = 0,
+    hits: int = 0,
+    score: float = 0.0,
+    created_at: str | None = None,
+    updated_at: str | None = None,
+    conn: sqlite3.Connection | None = None,
+    commit: bool = True,
+) -> int:
+    own_conn = conn is None
+    if own_conn:
+        conn = get_db()
     try:
-        existing = conn.execute(
-            "SELECT id FROM memory_slices WHERE msg_id_start = ? AND msg_id_end = ?",
-            (msg_id_start, msg_id_end)
-        ).fetchone()
-        if existing:
-            return int(existing["id"])
+        # Pass created_at/updated_at as parameters (may be None).
+        # SQLite will evaluate datetime('now') only when the parameter is NULL.
+        created_at_val = created_at
+        updated_at_val = updated_at
         cursor = conn.execute(
             """INSERT INTO memory_slices
                (conversation_id, conversation_ids, slice_index, msg_id_start, msg_id_end,
                 message_count, summary, tags, status, source_long_memory_id,
-                has_embedding, meta_json, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))""",
+                has_embedding, meta_json,
+                content, speaker, type, signals, context_anchor, context,
+                first_impact, hits, score,
+                created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                       ?, ?, ?, ?, ?, ?,
+                       ?, ?, ?, COALESCE(?, datetime('now')), COALESCE(?, datetime('now')))""",
             (
                 conversation_id,
                 conversation_ids,
@@ -1333,12 +1728,25 @@ def save_memory_slice(conversation_id: str, slice_index: int, msg_id_start: int,
                 source_long_memory_id,
                 has_embedding,
                 _json_dump(meta_json),
+                content,
+                speaker,
+                slice_type,
+                signals,
+                context_anchor,
+                context,
+                int(first_impact),
+                hits,
+                score,
+                created_at_val,
+                updated_at_val,
             )
         )
-        conn.commit()
+        if commit:
+            conn.commit()
         return cursor.lastrowid
     finally:
-        conn.close()
+        if own_conn and conn is not None:
+            conn.close()
 
 
 def get_memory_slice(slice_id: int) -> dict | None:
@@ -1350,18 +1758,96 @@ def get_memory_slice(slice_id: int) -> dict | None:
         conn.close()
 
 
+def _message_date_range_with_conn(
+    conn, msg_id_start: int, msg_id_end: int
+) -> tuple[str, str]:
+    """Like get_message_date_range but uses an existing connection (no close)."""
+    try:
+        if _table_exists(conn, "messages"):
+            row = conn.execute(
+                """SELECT MIN(date(created_at)) AS min_d, MAX(date(created_at)) AS max_d
+                   FROM messages WHERE id >= ? AND id <= ? AND created_at IS NOT NULL""",
+                (msg_id_start, msg_id_end),
+            ).fetchone()
+            if row and (row["min_d"] or row["max_d"]):
+                return (row["min_d"] or "", row["max_d"] or "")
+        if _table_exists(conn, "chat_history"):
+            time_col = "created_at" if "created_at" in _get_table_columns(conn, "chat_history") else None
+            if not time_col and "timestamp" in _get_table_columns(conn, "chat_history"):
+                time_col = "timestamp"
+            if time_col:
+                row = conn.execute(
+                    f"""SELECT MIN(date({time_col})) AS min_d, MAX(date({time_col})) AS max_d
+                        FROM chat_history WHERE id >= ? AND id <= ? AND {time_col} IS NOT NULL""",
+                    (msg_id_start, msg_id_end),
+                ).fetchone()
+                if row and (row["min_d"] or row["max_d"]):
+                    return (row["min_d"] or "", row["max_d"] or "")
+        return ("", "")
+    except Exception as e:
+        logger.warning(f"[DB] _message_date_range_with_conn failed: {e}")
+        return ("", "")
+
+
+def get_message_date_range(msg_id_start: int, msg_id_end: int) -> tuple[str, str]:
+    """Get min and max created_at (date part) from messages in the given id range.
+    Falls back to chat_history if messages table does not exist.
+    Returns (min_date, max_date) as YYYY-MM-DD strings, or ("", "") if no data.
+    """
+    conn = get_db()
+    try:
+        return _message_date_range_with_conn(conn, msg_id_start, msg_id_end)
+    finally:
+        conn.close()
+
+
 def list_memory_slices(status: str | None = None, limit: int = 50, offset: int = 0) -> list[dict]:
+    """List slices sorted by inferred source_date_start (desc), paginated.
+
+    Uses a lightweight id-only scan for ordering, then loads full rows only for
+    the requested page (avoids reading large TEXT columns for the whole table).
+    """
     conn = get_db()
     try:
         params: list = []
-        sql = "SELECT * FROM memory_slices"
+        sql = "SELECT id, msg_id_start, msg_id_end FROM memory_slices"
         if status:
             sql += " WHERE status = ?"
             params.append(status)
-        sql += " ORDER BY id DESC LIMIT ? OFFSET ?"
-        params.extend([limit, offset])
-        rows = conn.execute(sql, params).fetchall()
-        return [dict(r) for r in rows]
+        light = conn.execute(sql, params).fetchall()
+        ordered_meta: list[dict] = []
+        for r in light:
+            sid = int(r["id"])
+            ms = int(r["msg_id_start"] or 0)
+            me = int(r["msg_id_end"] or 0)
+            min_d, max_d = _message_date_range_with_conn(conn, ms, me)
+            ordered_meta.append(
+                {
+                    "id": sid,
+                    "source_date_start": min_d,
+                    "source_date_end": max_d,
+                }
+            )
+        ordered_meta.sort(key=lambda x: str(x.get("source_date_start", "")), reverse=True)
+        page_meta = ordered_meta[offset : offset + limit]
+        if not page_meta:
+            return []
+        ids = [m["id"] for m in page_meta]
+        placeholders = ",".join("?" * len(ids))
+        full_rows = conn.execute(
+            f"SELECT * FROM memory_slices WHERE id IN ({placeholders})",
+            ids,
+        ).fetchall()
+        id_to_row = {dict(r)["id"]: dict(r) for r in full_rows}
+        result: list[dict] = []
+        for m in page_meta:
+            s = id_to_row.get(m["id"])
+            if not s:
+                continue
+            s["source_date_start"] = m["source_date_start"]
+            s["source_date_end"] = m["source_date_end"]
+            result.append(s)
+        return result
     finally:
         conn.close()
 
@@ -1382,7 +1868,7 @@ def count_memory_slices(status: str | None = None) -> int:
 
 def update_memory_slice(slice_id: int, **updates) -> dict | None:
     allowed = {
-        "summary", "tags", "status", "source_long_memory_id",
+        "summary", "content", "tags", "status", "source_long_memory_id",
         "has_embedding", "meta_json",
     }
     fields = []
@@ -1425,7 +1911,7 @@ def get_recent_active_slices(limit: int = 4) -> list[dict]:
     try:
         rows = conn.execute(
             """SELECT * FROM memory_slices
-               WHERE status = 'active'
+               WHERE status IN ('active', 'in_pool', 'promoted')
                ORDER BY id DESC
                LIMIT ?""",
             (limit,)
@@ -1440,7 +1926,7 @@ def get_compactable_slice_groups(group_size: int = 4) -> list[list[dict]]:
     try:
         rows = conn.execute(
             """SELECT * FROM memory_slices
-               WHERE status = 'active'
+               WHERE status IN ('active', 'in_pool')
                ORDER BY id ASC"""
         ).fetchall()
         slices = [dict(r) for r in rows]
@@ -1458,7 +1944,7 @@ def mark_memory_slices_compacted(slice_ids: list[int], long_memory_id: int):
         placeholders = ",".join("?" * len(slice_ids))
         conn.execute(
             f"""UPDATE memory_slices
-                SET status = 'compacted',
+                SET status = 'promoted',
                     source_long_memory_id = ?,
                     updated_at = datetime('now')
                 WHERE id IN ({placeholders})""",
@@ -1550,6 +2036,35 @@ def get_long_term_memories_by_ids(memory_ids: list[int]) -> list[dict]:
         conn.close()
 
 
+def _enrich_long_term_source_dates(memories: list[dict]) -> None:
+    """Add source_date_start, source_date_end to each memory from its source slices."""
+    conn = get_db()
+    try:
+        for m in memories:
+            start_id = int(m.get("source_slice_start_id", 0) or 0)
+            end_id = int(m.get("source_slice_end_id", 0) or 0)
+            if not start_id and not end_id:
+                m["source_date_start"] = ""
+                m["source_date_end"] = ""
+                continue
+            rows = conn.execute(
+                """SELECT msg_id_start, msg_id_end FROM memory_slices
+                   WHERE id >= ? AND id <= ? ORDER BY id""",
+                (min(start_id, end_id), max(start_id, end_id)),
+            ).fetchall()
+            if not rows:
+                m["source_date_start"] = ""
+                m["source_date_end"] = ""
+                continue
+            msg_start = min(r["msg_id_start"] for r in rows)
+            msg_end = max(r["msg_id_end"] for r in rows)
+            min_d, max_d = get_message_date_range(msg_start, msg_end)
+            m["source_date_start"] = min_d
+            m["source_date_end"] = max_d
+    finally:
+        conn.close()
+
+
 def list_long_term_memories(status: str | None = None, limit: int = 50,
                             offset: int = 0) -> list[dict]:
     conn = get_db()
@@ -1562,7 +2077,9 @@ def list_long_term_memories(status: str | None = None, limit: int = 50,
         sql += " ORDER BY id DESC LIMIT ? OFFSET ?"
         params.extend([limit, offset])
         rows = conn.execute(sql, params).fetchall()
-        return [dict(r) for r in rows]
+        result = [dict(r) for r in rows]
+        _enrich_long_term_source_dates(result)
+        return result
     finally:
         conn.close()
 
@@ -1948,6 +2465,77 @@ def save_review_item(review_type: str, proposed_payload, diff_summary: str = "",
 
 def get_review_item(review_id: int) -> dict | None:
     return get_pending_review(review_id)
+
+
+# ---------- Core Facts (防篡改核心档案) ----------
+def list_core_facts() -> list[dict]:
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM core_facts ORDER BY sort_order ASC, id ASC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def create_core_fact(title: str, content: str, fact_type: str = "core") -> int:
+    conn = get_db()
+    try:
+        max_order = conn.execute("SELECT COALESCE(MAX(sort_order), 0) FROM core_facts").fetchone()[0]
+        cursor = conn.execute(
+            """INSERT INTO core_facts (title, content, fact_type, sort_order)
+               VALUES (?, ?, ?, ?)""",
+            (title, content, fact_type, int(max_order or 0) + 1),
+        )
+        conn.commit()
+        return cursor.lastrowid
+    finally:
+        conn.close()
+
+
+def update_core_fact(fact_id: int, title: str = None, content: str = None) -> dict | None:
+    conn = get_db()
+    try:
+        updates = []
+        params = []
+        if title is not None:
+            updates.append("title = ?")
+            params.append(title)
+        if content is not None:
+            updates.append("content = ?")
+            params.append(content)
+        if not updates:
+            return get_core_fact(fact_id)
+        params.append(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        params.append(fact_id)
+        conn.execute(
+            f"UPDATE core_facts SET {', '.join(updates)}, updated_at = ? WHERE id = ?",
+            params,
+        )
+        conn.commit()
+        return get_core_fact(fact_id)
+    finally:
+        conn.close()
+
+
+def get_core_fact(fact_id: int) -> dict | None:
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT * FROM core_facts WHERE id = ?", (fact_id,)).fetchone()
+        return _row_to_dict(row)
+    finally:
+        conn.close()
+
+
+def delete_core_fact(fact_id: int) -> bool:
+    conn = get_db()
+    try:
+        conn.execute("DELETE FROM core_facts WHERE id = ?", (fact_id,))
+        conn.commit()
+        return True
+    finally:
+        conn.close()
 
 
 def list_review_items(status: str | None = None, limit: int = 50, offset: int = 0) -> list[dict]:

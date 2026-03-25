@@ -68,6 +68,128 @@ def _keyword_score(query: str, text: str) -> float:
     return min(1.0, hits / max(1, len(set(tokens))))
 
 
+def _slice_overlap_score(token_set: set[str], text: str) -> float:
+    if not token_set:
+        return 0.0
+    t = (text or "").lower()
+    if not t:
+        return 0.0
+    hits = sum(1 for token in token_set if token and token in t)
+    return hits / max(1, len(token_set))
+
+
+def _search_delay_pool_slices(query: str, top_k: int = 3) -> list[str]:
+    """
+    Search memory_slices delay pool:
+      status in ('in_pool','promoted')
+    and format results for direct LLM injection.
+    """
+    # Weight mapping (W_fact)
+    W_fact = {
+        "promise": 10.0,
+        "trigger": 8.0,
+        "boundary": 8.0,
+        "preference": 8.0,
+        "emotion_pattern": 6.0,
+        "detail_anchor": 2.0,
+    }
+
+    # Tokenize query for overlap-based relevance
+    tokens = _tokenize_query(query)
+    token_set = set(tokens)
+
+    from database import get_db
+
+    conn = get_db()
+    try:
+        # Fetch a bounded candidate set; ranking happens in Python.
+        rows = conn.execute(
+            """
+            SELECT id,
+                   content,
+                   COALESCE(type, '') AS type,
+                   COALESCE(signals, '') AS signals,
+                   COALESCE(context_anchor, '') AS context_anchor,
+                   COALESCE(speaker, '') AS speaker,
+                   COALESCE(hits, 0) AS hits,
+                   COALESCE(first_impact, 0) AS first_impact,
+                   COALESCE(score, 0.0) AS score,
+                   created_at
+            FROM memory_slices
+            WHERE status IN ('in_pool', 'promoted')
+            ORDER BY first_impact DESC, hits DESC, score DESC, id DESC
+            LIMIT 200
+            """
+        ).fetchall()
+
+        candidates: list[tuple[float, int, dict]] = []
+        for r in rows:
+            slice_id = int(r["id"])
+            content = (r["content"] or "").strip()
+            anchor = (r["context_anchor"] or "").strip()
+            if not content or not anchor:
+                continue
+
+            slice_type = (r["type"] or "").strip()
+            hits = int(r["hits"] or 0)
+            first_impact = int(r["first_impact"] or 0)
+
+            base = W_fact.get(slice_type, 1.0)
+            keyword_blob = " ".join([
+                content,
+                anchor,
+                r.get("signals", "") or "",
+                slice_type,
+            ])
+            kw_score = _slice_overlap_score(token_set, keyword_blob)
+
+            # Eligibility filter: include if relevant OR explicitly high-value.
+            # (We still don't want to flood; keywords are a cheap relevance proxy.)
+            if kw_score <= 0 and first_impact == 0 and hits == 0 and base < 8.0:
+                continue
+
+            # Score used for ranking (same spirit as manage_delay_pool).
+            computed = base * (1.0 + 0.35 * math.log(1.0 + hits))
+            if first_impact == 1:
+                computed += 3.0
+
+            # Encourage keyword match.
+            final = computed + 3.0 * kw_score
+
+            candidates.append((final, slice_id, dict(r)))
+
+        candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        picked = candidates[:top_k]
+        picked_ids = [pid for _, pid, _ in picked]
+
+        if picked_ids:
+            placeholders = ",".join(["?"] * len(picked_ids))
+            conn.execute(
+                f"""
+                UPDATE memory_slices
+                SET hits = COALESCE(hits, 0) + 1,
+                    updated_at = datetime('now')
+                WHERE id IN ({placeholders})
+                """,
+                picked_ids,
+            )
+            conn.commit()
+
+        formatted: list[str] = []
+        for _, slice_id, r in picked:
+            speaker_raw = (r.get("speaker") or "").strip()
+            speaker_label = "肖珂" if speaker_raw == "肖珂" else "淘淘"
+            anchor = (r.get("context_anchor") or "").strip()
+            content = (r.get("content") or "").strip()
+            # Keep injection compact but preserve raw quote.
+            content = content[:800]
+            formatted.append(f"[语境: {anchor}] 曾提到{speaker_label}: {content}")
+
+        return formatted
+    finally:
+        conn.close()
+
+
 def _memory_age_days(row: dict) -> int:
     anchor = row.get("last_hit_at") or row.get("updated_at") or row.get("created_at")
     if not anchor:
@@ -220,6 +342,18 @@ def execute_search_memory(query: str) -> str:
                 logger.info(f"[search_memory] legacy card search: {len(cards)} matches")
         except Exception as e:
             logger.warning(f"[search_memory] legacy card search failed: {e}")
+
+    # --- Delay pool slices (原话切片延迟池) ---
+    # We inject a compact "context-anchor -> mentioned quote" format so the LLM can
+    # understand applicability and avoid hallucinating outdated events.
+    try:
+        slice_context_lines = _search_delay_pool_slices(query, top_k=3)
+        if slice_context_lines and len(results) < 6:
+            slots = max(0, 6 - len(results))
+            results.extend(slice_context_lines[:slots])
+            logger.info(f"[search_memory] delay pool slices injected: {len(slice_context_lines)}")
+    except Exception as e:
+        logger.warning(f"[search_memory] delay pool slices search failed: {e}")
 
     if query_vec is not None:
         try:

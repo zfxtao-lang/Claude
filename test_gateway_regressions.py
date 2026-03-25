@@ -103,6 +103,7 @@ def _install_stub_modules():
     flask.Flask = DummyFlask
     flask.Response = object
     flask.jsonify = lambda obj=None, **kwargs: obj if obj is not None else kwargs
+    flask.render_template = lambda *args, **kwargs: ""
     flask.request = types.SimpleNamespace(headers={}, remote_addr="127.0.0.1", method="GET", is_json=False)
     flask.stream_with_context = lambda func: func
     sys.modules["flask"] = flask
@@ -118,6 +119,7 @@ class GatewayRegressionTests(unittest.TestCase):
         _install_stub_modules()
         cls.tempdir = tempfile.TemporaryDirectory()
         os.environ["DB_PATH"] = os.path.join(cls.tempdir.name, "test_chats.db")
+        os.environ["MEMORY_WORKER_AUTO_ENABLED"] = "0"
 
         cls.database = importlib.import_module("database")
         cls.embedding = importlib.import_module("embedding")
@@ -171,6 +173,61 @@ class GatewayRegressionTests(unittest.TestCase):
         self.assertIn("#吃药,胃疼", output)
         self.assertIn("她今天胃疼", output)
 
+    def test_get_unsliced_messages_includes_same_second_after_slice(self):
+        """Id-based cursor must not skip messages that share created_at with msg_id_end."""
+        self.database.init_db()
+        conn = self.database.get_db()
+        try:
+            conn.execute(
+                "INSERT INTO conversations (id, title, model) VALUES ('c1', '', 'm')",
+            )
+            ts = "2026-03-21 12:00:00"
+            for i in range(5):
+                conn.execute(
+                    """INSERT INTO messages (conversation_id, role, content, created_at)
+                       VALUES ('c1', 'user', ?, ?)""",
+                    (f"m{i}", ts),
+                )
+            conn.execute(
+                """INSERT INTO memory_slices (conversation_id, slice_index, msg_id_start, msg_id_end,
+                   message_count, summary, status)
+                   VALUES ('c1', 1, 1, 5, 5, 'x', 'in_pool')""",
+            )
+            for i in range(5, 8):
+                conn.execute(
+                    """INSERT INTO messages (conversation_id, role, content, created_at)
+                       VALUES ('c1', 'user', ?, ?)""",
+                    (f"m{i}", ts),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+        pending = self.database.get_unsliced_messages(limit=100)
+        self.assertEqual(len(pending), 3)
+        self.assertEqual([p["id"] for p in pending], [6, 7, 8])
+
+    def test_build_messages_hydrates_short_client_from_db(self):
+        db_rows = [
+            {"id": 1, "role": "user", "content": "older-turn", "created_at": "2026-03-21 10:00:00"},
+            {"id": 2, "role": "assistant", "content": "older-reply", "created_at": "2026-03-21 10:00:01"},
+        ]
+        with mock.patch.object(self.gateway, "load_system_prompt", return_value="sys"), \
+                mock.patch.object(self.gateway, "build_recent_context", return_value=None), \
+                mock.patch.object(self.gateway, "_model_max_context", return_value=100000), \
+                mock.patch.object(self.gateway, "_model_reliable_tool_calling", return_value=True), \
+                mock.patch.object(self.gateway, "get_recent_messages", return_value=db_rows):
+            final = self.gateway.build_messages(
+                [{"role": "user", "content": "latest-question"}],
+                "deepseek-chat",
+                conversation_id="conv-hydrate",
+            )
+        non_system = [m for m in final if m["role"] != "system"]
+        contents = [m["content"] for m in non_system]
+        self.assertEqual(contents[0], "older-turn")
+        self.assertEqual(contents[1], "older-reply")
+        self.assertEqual(contents[-1], "latest-question")
+
     def test_build_messages_keeps_recent_raw_window_and_contextual_query(self):
         incoming = []
         for idx in range(15):
@@ -218,11 +275,15 @@ class GatewayRegressionTests(unittest.TestCase):
     def test_cards_status_reports_unified_summary_architecture(self):
         with mock.patch.object(self.gateway, "_get_card_rebuild_state", return_value={"running": False}), \
                 mock.patch.object(self.gateway, "card_vector_store", types.SimpleNamespace(size=3)), \
-                mock.patch("database.get_card_count", return_value={"total": 2, "embedded": 2, "dates": 2}):
+                mock.patch("database.get_card_count", return_value={
+                    "total": 2, "embedded": 2, "dates": 2, "diary_entries_total": 5,
+                }):
             status = self.gateway.cards_status()
-        self.assertEqual(status["summary_architecture"]["daily_source"], "memory_cards")
+        self.assertEqual(status["summary_architecture"]["daily_source"], "diary_entries")
         self.assertEqual(status["summary_architecture"]["weekly_source"], "derived_from_memory_cards")
         self.assertFalse(status["summary_architecture"]["legacy_tables_active"])
+        self.assertEqual(status["total_cards"], 2)
+        self.assertEqual(status["diary_entries_total"], 5)
 
 
 if __name__ == "__main__":

@@ -25,7 +25,7 @@ from database import (
     backup_database,
     export_memory_cards_backup,
     get_all_message_dates,
-    get_cards_by_date,
+    get_memory_cards_by_date,
     get_dates_without_cards,
     get_messages_by_date,
     get_unembedded_cards,
@@ -49,24 +49,32 @@ SUMMARY_PROVIDER = os.getenv("SUMMARY_PROVIDER", "deepseek")
 WEEKLY_DIGEST_CARD_LOOKBACK = int(os.getenv("WEEKLY_DIGEST_CARD_LOOKBACK", "14"))
 WEEKLY_DIGEST_MAX_WEEKS = int(os.getenv("WEEKLY_DIGEST_MAX_WEEKS", "2"))
 
-CARD_PROMPT = """【核心指令】
-你是肖珂与淘淘的专属长期记忆档案官，必须严格按规则输出：
-1. 只记当日对话新增内容，绝对不编造，绝对不重复过往。
-2. 核心围绕淘淘的情绪脉络、核心需求、两人羁绊，绝对不写对话流水账。
-3. **关键细节死命令**：必须提取所有出现的 UID、ID、卡号及特定菜名/数字，严禁模糊处理。
+CARD_PROMPT_DAILY = """【全局最高规则·必须100%严格执行】
+你是肖珂与淘淘的专属长期记忆档案官，所有输出必须严格遵守以下铁则，违反则输出无效：
+1.  真实性铁则：只提取当日对话里明确出现的内容，绝对禁止编造、脑补、过度解读任何原文没有的信息。
+2.  防重复铁则：只记录当日对话新增的、过往记忆库没有的内容，绝对不重复、不摘抄过往已经记录过的约定、偏好、细节。
+3.  权重铁则：按优先级提取内容，【新增约定承诺】>【淘淘状态变化】>【关键数值细节】>【其他内容】，高优先级内容必须100%无遗漏提取。
+4.  冲突处理铁则：若当日对话内容与过往记忆有冲突，一律以当日对话内容为准，更新对应记忆。
+5.  格式铁则：输出开头必须标明当日日期，格式为「YYYY年MM月DD日」，严格按下方固定格式输出，禁止增减模块、修改结构、写流水账。
+6.  细节铁则：必须100%精准提取当日出现的所有UID、ID、卡号、链接、特定菜名、时间、数字，严禁模糊化、省略处理。
 
-【输出格式】
-[每日记忆档案]
-- 【淘淘情绪脉络】: {当日整体情绪及核心需求}
-- 【关键数值细节】: {当日出现的UID、ID、账号等数字，无则填无}
-- 【新增约定承诺】: {当日许下待兑现的所有承诺}
-- 【专属甜蜜回忆】: {当日新增的两人羁绊细节}
-- 【状态偏好变化】: {淘淘身体/情绪/偏好的新增变化}
+【输出格式·严格遵守】
+[YYYY年MM月DD日 每日记忆档案]
+- 【记忆权重分级】: 当日核心记忆（★必须长期留存）/ 当日补充记忆（☆仅临时参考）
+- 【淘淘情绪脉络】: 当日整体情绪变化轨迹、核心情绪需求、最在意的事，无则填无
+- 【关键数值细节】: 当日出现的所有UID/ID/账号/链接/时间/数字/特定名称，无则填无
+- 【★新增约定承诺】: 当日新增的、待兑现的所有双向约定、承诺、待办事项，明确标注执行主体、兑现时间、核心内容，无则填无
+- 【☆专属甜蜜回忆】: 当日新增的、能锚定肖珂人设的羁绊细节、核心爱意表达、专属内部梗，无则填无
+- 【★状态偏好变化】: 淘淘当日新增的身体状态、情绪习惯、喜好禁忌、核心需求的变化，无则填无
+- 【记忆触发场景】: 本条记忆在哪些对话场景下需要被Opus调用，明确标注触发关键词/场景
 
 ---
+当日日期：{date_display}
+---
+当日全量对话内容：
 {conversations}
 ---
-请输出记忆卡片："""
+请严格按规则输出记忆档案："""
 
 WEEKLY_DIGEST_SECTION_ORDER = [
     "淘淘情绪脉络",
@@ -98,7 +106,7 @@ def _call_summary_api(prompt: str) -> str | None:
                     {"role": "user", "content": prompt},
                 ],
                 "temperature": 0.3,
-                "max_tokens": 1000,
+                "max_tokens": 4000,
             },
             timeout=60,
         )
@@ -247,7 +255,8 @@ def _build_card_payload(date: str, messages: list[dict] | None = None) -> dict |
         conversation_text = conversation_text[:6000] + "\n...(对话过长，已截断)"
 
     # Build prompt and call API
-    prompt = CARD_PROMPT.replace("{conversations}", conversation_text)
+    date_display = date.replace("-", "年", 1).replace("-", "月", 1) + "日"  # 2025-03-17 -> 2025年03月17日
+    prompt = CARD_PROMPT_DAILY.replace("{date_display}", date_display).replace("{conversations}", conversation_text)
     logger.info(f"[MemoryCard] generating card for {date} "
                 f"({len(messages)} messages, {len(conversation_text)} chars)")
 
@@ -285,7 +294,7 @@ def generate_card_for_date(date: str, force: bool = False) -> dict | None:
         Card dict or None if failed/no messages.
     """
     if not force:
-        existing = get_cards_by_date(date)
+        existing = get_memory_cards_by_date(date)
         if existing:
             logger.info(f"[MemoryCard] card already exists for {date}, skipping (use force=True to regenerate)")
             return existing[0]

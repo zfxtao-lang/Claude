@@ -5,7 +5,13 @@ __pycache__/
 backups/
 venv/
 
-# User-specific files (don't overwrite on git pull)
-system_prompt.txt
-vectors.npy
-vectors_ids.npy
+# Private snapshots / logs (not for GitHub)
+output/
+*.log
+*.npy
+*.txt
+!requirements.txt
+!system_prompt.txt
+*.bak
+*.save
+*.save.*

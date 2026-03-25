@@ -177,7 +177,12 @@ def _strip_json_fence(text: str) -> str:
     return text.strip()
 
 
-def call_memory_worker(prompt: str, system_text: str, usage_stats: dict | None = None) -> str | None:
+def call_memory_worker(
+    prompt: str,
+    system_text: str,
+    usage_stats: dict | None = None,
+    max_tokens: int = 1800,
+) -> str | None:
     if not _worker_ready():
         logger.warning("[MemoryPipeline] memory worker API is not configured")
         return None
@@ -195,7 +200,7 @@ def call_memory_worker(prompt: str, system_text: str, usage_stats: dict | None =
                     {"role": "user", "content": prompt},
                 ],
                 "temperature": 0.4,
-                "max_tokens": 1800,
+                "max_tokens": max_tokens,
             },
             timeout=90,
         )
@@ -367,6 +372,7 @@ def generate_daily_diary(entry_date: str, worker_run_id: int | None = None,
         ),
         "你是肖珂的内心日记代笔助手。",
         usage_stats=usage_stats,
+        max_tokens=4000,
     )
     if not raw:
         return None

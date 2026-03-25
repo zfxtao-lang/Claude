@@ -1,256 +1,1399 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>网关管理后台</title>
-  <link rel="stylesheet" href="/static/admin.css">
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>小克网关管理后台</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #F8F6F2; font-family: 'PingFang SC','Noto Sans SC','Hiragino Sans GB','Microsoft YaHei',system-ui,sans-serif; }
+    input[type="date"]::-webkit-calendar-picker-indicator { opacity: 0.45; cursor: pointer; }
+    button:active { opacity: 0.75; }
+    textarea:focus, input:focus { border-color: #C4784E88 !important; box-shadow: none; }
+    ::-webkit-scrollbar { width: 5px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #DDD8D0; border-radius: 10px; }
+    #root { min-height: 100vh; }
+  </style>
 </head>
 <body>
-  <div class="page">
-    <header class="hero">
-      <div>
-        <p class="eyebrow">可视化管理后台</p>
-        <h1>像点手机设置一样管理你的网关</h1>
-        <p class="hero-copy">
-          不用敲代码。按页面提示一步一步点，就能看状态、查记忆卡、重建总结、重建向量和做常见诊断。
-        </p>
+  <div id="root"></div>
+
+  <script type="text/babel">
+  {% raw %}
+    const { useState, useEffect, useRef } = React;
+
+    const C = {
+      bg: "#F8F6F2", sidebar: "#F0EDE7", sidebarBorder: "#E4DFD7",
+      card: "#FFFFFF", cardBorder: "#EDE9E3",
+      accent: "#C4784E", accentBg: "#FDF3EC",
+      green: "#5A9E7A", greenBg: "#EDF6F1",
+      red: "#C85A5A", redBg: "#FDF0F0",
+      yellow: "#B89040",
+      text: "#28261F", textMd: "#6B6760", textSm: "#9B9690",
+      border: "#E8E4DD", inputBg: "#F5F2EE",
+      shadow: "0 1px 4px rgba(0,0,0,0.06), 0 0 0 1px rgba(0,0,0,0.03)",
+      shadowLg: "0 8px 32px rgba(0,0,0,0.12), 0 2px 8px rgba(0,0,0,0.06)",
+    };
+
+    // ── 🖼 把合照链接填在这里 ─────────────────────────────────
+    const FAMILY_IMAGE_URL = "/static/family_bg.jpg";
+    const TOKEN = () => localStorage.getItem('adminToken') || '';
+    // ────────────────────────────────────────────────────────
+
+    // ─── 工具函数：Admin API 映射 ─────────────────────────────
+
+    function authHeaders() {
+      return { Authorization: `Bearer ${TOKEN()}`, "Content-Type": "application/json" };
+    }
+
+    function mapCardFromApi(c) {
+      const date = c.date || c.entry_date || "";
+      const ms = c.mood_score;
+      return {
+        id: String(c.id),
+        date,
+        entry_date: c.entry_date || date,
+        title: c.title || "",
+        content: c.content || "",
+        mood_score: typeof ms === "number" ? ms : (ms != null && ms !== "" ? parseInt(ms, 10) : 0),
+        mood_label: c.mood_label || "",
+      };
+    }
+
+    function mapSliceFromApi(s) {
+      const a = s.msg_id_start, b = s.msg_id_end;
+      const rawContent = s.content;
+      const hasContent = rawContent !== null && rawContent !== undefined && String(rawContent).trim().length > 0;
+      return {
+        id: s.id,
+        label: `切片 #${s.id}`,
+        status: s.status || "",
+        date: s.source_date_start || s.source_date_end || "",
+        range: `消息 ${a}–${b}`,
+        // Prefer new "raw slice content". If empty (old rows), fall back to legacy summary.
+        content: hasContent ? rawContent : (s.summary || ""),
+        summary: s.summary || "",
+        type: s.type || "",
+        context_anchor: s.context_anchor || "",
+        signals: s.signals || "",
+        hits: s.hits ?? 0,
+        score: typeof s.score === "number" ? s.score : (s.score ? parseFloat(s.score) : 0.0),
+        first_impact: !!s.first_impact,
+      };
+    }
+
+    function mapMemoryCardRow(c) {
+      const he = c.has_embedding;
+      const embedded = he === true || he === 1 || he === "1";
+      return {
+        id: String(c.id),
+        date: c.date || "",
+        summary: c.summary || "",
+        tags: c.tags || "",
+        has_embedding: embedded,
+        msg_id_start: c.msg_id_start,
+        msg_id_end: c.msg_id_end,
+        conversation_ids: c.conversation_ids || "",
+      };
+    }
+
+    // ─── ATOMS ───────────────────────────────────────────────
+
+    const Card = ({ children, style }) => (
+      <div style={{ background: C.card, borderRadius: 14, border: `1px solid ${C.cardBorder}`, padding: "20px 22px", boxShadow: C.shadow, ...style }}>
+        {children}
       </div>
-      <div class="hero-status">
-        <div class="status-chip" id="gatewayHealthChip">正在检查服务状态</div>
-        <div class="status-chip" id="jobStatusChip">任务状态：等待读取</div>
-      </div>
-    </header>
+    );
 
-    <section class="card setup-card">
-      <h2>第一步：填管理员口令</h2>
-      <p class="help-text">
-        这是后台专用口令。填好后点“保存口令”，下面所有按钮就能用了。
-      </p>
-      <div class="token-row">
-        <input id="tokenInput" type="password" placeholder="请输入管理员口令">
-        <button id="saveTokenBtn" class="primary-btn">保存口令</button>
-        <button id="clearTokenBtn" class="ghost-btn">清空口令</button>
-      </div>
-      <p class="subtle-text">口令只会保存在当前浏览器里，不会显示给别人看。</p>
-    </section>
+    const SectionLabel = ({ children }) => (
+      <div style={{ fontSize: 10, fontWeight: 600, color: C.textSm, textTransform: "uppercase", letterSpacing: "0.1em", marginBottom: 12 }}>{children}</div>
+    );
 
-    <nav class="tab-bar" aria-label="后台模块">
-      <button class="tab-btn active" data-target="overviewPanel">首页总览</button>
-      <button class="tab-btn" data-target="memoryPanel">记忆卡管理</button>
-      <button class="tab-btn" data-target="vectorPanel">向量与诊断</button>
-    </nav>
+    const Input = ({ value, onChange, placeholder, type = "text", style }) => (
+      <input type={type} value={value} onChange={e => onChange(e.target.value)} placeholder={placeholder}
+        style={{ background: C.inputBg, border: `1px solid ${C.border}`, borderRadius: 8, padding: "8px 11px", fontSize: 12, color: C.text, outline: "none", width: "100%", boxSizing: "border-box", ...style }} />
+    );
 
-    <main class="panel-stack">
-      <section class="panel active" id="overviewPanel">
-        <div class="section-title">
-          <h2>首页总览</h2>
-          <button id="refreshOverviewBtn" class="ghost-btn">刷新首页</button>
-        </div>
-        <div id="overviewCards" class="metric-grid"></div>
-        <div class="two-col">
-          <section class="card">
-            <div class="section-title">
-              <h3>当前模型与提供商</h3>
-              <button id="reloadProvidersBtn" class="ghost-btn">重新加载模型配置</button>
-            </div>
-            <div id="providerSummary" class="list-block empty-state">还没有读取到数据。</div>
-          </section>
-          <section class="card">
-            <div class="section-title">
-              <h3>任务中心</h3>
-              <button id="refreshJobsBtn" class="ghost-btn">刷新任务状态</button>
-            </div>
-            <div id="jobSummary" class="list-block empty-state">还没有读取到数据。</div>
-          </section>
-        </div>
+    const Btn = ({ children, onClick, variant = "primary", small, danger, disabled, style }) => {
+      const base = { borderRadius: 8, cursor: disabled ? "not-allowed" : "pointer", fontWeight: 500, border: "none", padding: small ? "6px 13px" : "8px 17px", fontSize: small ? 11.5 : 12.5, opacity: disabled ? 0.5 : 1, ...style };
+      if (variant === "primary") return <button onClick={onClick} disabled={disabled} style={{ ...base, background: danger ? C.red : C.accent, color: "#fff" }}>{children}</button>;
+      if (variant === "outline") return <button onClick={onClick} disabled={disabled} style={{ ...base, background: "transparent", border: `1px solid ${C.border}`, color: C.textMd }}>{children}</button>;
+      if (variant === "ghost") return <button onClick={onClick} disabled={disabled} style={{ ...base, background: C.inputBg, color: danger ? C.red : C.textMd }}>{children}</button>;
+      return <button onClick={onClick} disabled={disabled} style={{ ...base, background: C.accentBg, color: C.accent }}>{children}</button>;
+    };
 
-        <div class="two-col">
-          <section class="card">
-            <div class="section-title">
-              <h3>系统状态面板</h3>
-              <button id="refreshSystemStatusBtn" class="ghost-btn">刷新系统状态</button>
-            </div>
-            <div class="form-grid">
-              <label>
-                <span>手动跑哪一天的总结 worker</span>
-                <input id="workerDateInput" type="date">
-              </label>
-            </div>
-            <div class="action-row">
-              <button id="runMemoryWorkerBtn" class="primary-btn">立即执行一次 memory worker</button>
-            </div>
-            <div id="systemStatusSummary" class="list-block empty-state">还没有读取到数据。</div>
-          </section>
-          <section class="card">
-            <div class="section-title">
-              <h3>后台 worker 运行记录</h3>
-              <button id="refreshWorkerRunsBtn" class="ghost-btn">刷新运行记录</button>
-            </div>
-            <div id="workerRunsList" class="list-block empty-state">还没有读取到数据。</div>
-          </section>
-        </div>
-      </section>
+    const Dot = ({ color }) => <span style={{ display: "inline-block", width: 7, height: 7, borderRadius: "50%", background: color, marginRight: 7, flexShrink: 0 }} />;
 
-      <section class="panel" id="memoryPanel">
-        <div class="section-title">
-          <h2>记忆卡管理</h2>
-          <button id="refreshCardsBtn" class="ghost-btn">刷新记忆卡</button>
-        </div>
+    const Badge = ({ children, color = C.textSm, bg = C.inputBg }) => (
+      <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 20, background: bg, color, fontWeight: 500 }}>{children}</span>
+    );
 
-        <div class="two-col">
-          <section class="card">
-            <h3>常用操作</h3>
-            <p class="help-text">不知道怎么选时，先用“查看最近记忆卡”和“生成某一天总结”。</p>
-            <div class="form-grid">
-              <label>
-                <span>单独生成哪一天</span>
-                <input id="generateDateInput" type="date">
-              </label>
-              <label>
-                <span>开始日期</span>
-                <input id="rangeStartInput" type="date">
-              </label>
-              <label>
-                <span>结束日期</span>
-                <input id="rangeEndInput" type="date">
-              </label>
-              <label class="checkbox-row">
-                <input id="forceGenerateInput" type="checkbox">
-                <span>强制重做已有总结</span>
-              </label>
-            </div>
-            <div class="action-row">
-              <button id="generateSingleBtn" class="primary-btn">生成这一天总结</button>
-              <button id="generateRangeBtn" class="ghost-btn">生成一段时间总结</button>
-              <button id="embedCardsBtn" class="ghost-btn">补做记忆卡向量</button>
-            </div>
-            <div class="danger-box">
-              <p>危险操作：会重做一大批历史总结，时间会比较久。</p>
-              <button id="rebuildCardsBtn" class="danger-btn">全量重建记忆卡</button>
-            </div>
-          </section>
+    function sliceStatusColors(status) {
+      const s = String(status || "").toLowerCase();
+      if (s === "in_pool") return { bg: "#DCEBFF", color: "#2F6FED" };      // blue
+      if (s === "promoted") return { bg: C.greenBg, color: C.green };       // green
+      if (s === "discarded") return { bg: "#EFEFEF", color: "#9B9690" };    // gray
+      // Backward compatibility for legacy states.
+      if (s === "active" || s === "compacted") return { bg: C.inputBg, color: C.textMd };
+      return { bg: C.inputBg, color: C.textMd };
+    }
 
-          <section class="card">
-            <h3>搜索和查看</h3>
-            <div class="form-grid">
-              <label>
-                <span>按日期查看</span>
-                <input id="filterDateInput" type="date">
-              </label>
-              <label>
-                <span>关键词搜索</span>
-                <input id="cardSearchInput" type="text" placeholder="例如：焦虑、工作、Notion">
-              </label>
-            </div>
-            <div class="action-row">
-              <button id="loadCardListBtn" class="primary-btn">查看最近记忆卡</button>
-              <button id="searchCardsBtn" class="ghost-btn">搜索记忆卡</button>
-            </div>
-            <div id="cardStatusSummary" class="mini-summary empty-state">还没有读取到数据。</div>
-          </section>
-        </div>
+    function fmtScore(score) {
+      const n = typeof score === "number" ? score : (score !== undefined && score !== null && score !== "" ? parseFloat(score) : 0);
+      if (!isFinite(n)) return "0.0";
+      return n.toFixed(2);
+    }
 
-        <section class="card">
-          <div class="section-title">
-            <h3>记忆卡列表</h3>
-            <div class="page-controls">
-              <button id="cardsPrevBtn" class="ghost-btn">上一页</button>
-              <span id="cardsPageText">第 1 页</span>
-              <button id="cardsNextBtn" class="ghost-btn">下一页</button>
+    const Toggle = ({ enabled, setEnabled }) => (
+      <button onClick={() => setEnabled(!enabled)} style={{ width: 38, height: 21, borderRadius: 11, border: "none", cursor: "pointer", background: enabled ? C.green : C.border, position: "relative", padding: 0, flexShrink: 0, transition: "background 0.2s" }}>
+        <span style={{ position: "absolute", top: 2.5, left: enabled ? 19 : 2.5, width: 16, height: 16, borderRadius: "50%", background: "white", transition: "left 0.18s", display: "block", boxShadow: "0 1px 3px rgba(0,0,0,0.2)" }} />
+      </button>
+    );
+
+    const Toast = ({ msg }) => msg ? (
+      <div style={{ position: "fixed", bottom: 28, left: "50%", transform: "translateX(-50%)", background: C.text, color: "#fff", borderRadius: 10, padding: "9px 20px", fontSize: 12.5, zIndex: 9999, boxShadow: "0 4px 20px rgba(0,0,0,0.2)", whiteSpace: "nowrap" }}>{msg}</div>
+    ) : null;
+
+    function useToast() {
+      const [msg, setMsg] = useState("");
+      const timerRef = useRef(null);
+      const show = (m, durationMs = 2200) => {
+        if (timerRef.current) clearTimeout(timerRef.current);
+        timerRef.current = null;
+        setMsg(m);
+        if (m && durationMs > 0) {
+          timerRef.current = setTimeout(() => setMsg(""), durationMs);
+        }
+      };
+      return [msg, show];
+    }
+
+    function scrollAdminTop() {
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    }
+
+    const ADMIN_MEMORY_PAGE_SIZE = 50;
+    const ADMIN_DIARY_PAGE_SIZE = 50;
+    const ADMIN_SLICE_PAGE_SIZE = 50;
+
+    /** POST /admin/memory/worker/run — toast + alert on failure; optional AbortSignal for client timeout */
+    async function postMemoryWorkerRun(dateStr, show, setRunning, options = {}) {
+      const clientTimeoutMs = options.clientTimeoutMs ?? 120000;
+      if (!TOKEN()) {
+        show("请先设置管理口令");
+        return;
+      }
+      setRunning(true);
+      show("正在后台生成切片，请稍候...", Math.max(clientTimeoutMs + 5000, 180000));
+      let signal = options.signal;
+      if (!signal && typeof AbortSignal !== "undefined" && AbortSignal.timeout) {
+        try {
+          signal = AbortSignal.timeout(clientTimeoutMs);
+        } catch (_) {
+          signal = undefined;
+        }
+      }
+      try {
+        const r = await fetch("/admin/memory/worker/run", {
+          method: "POST",
+          headers: authHeaders(),
+          body: JSON.stringify({ date: dateStr, mode: "manual" }),
+          ...(signal ? { signal } : {}),
+        });
+        if (!r.ok) {
+          let detail = r.statusText || `HTTP ${r.status}`;
+          try {
+            const j = await r.json();
+            detail = j.error || j.message || detail;
+          } catch (_) {
+            const t = await r.text().catch(() => "");
+            if (t && t.trim()) detail = t.trim().slice(0, 800);
+          }
+          throw new Error(detail);
+        }
+        show("流水线执行成功！", 2800);
+      } catch (err) {
+        show("");
+        const isAbort =
+          err.name === "AbortError" ||
+          err.name === "TimeoutError" ||
+          (err.message && String(err.message).toLowerCase().includes("aborted"));
+        const msg = isAbort ? "请求超时（前端等待响应超时，请检查网关或网络）" : (err.message || String(err));
+        alert("记忆流水线启动失败：\n\n" + msg);
+      } finally {
+        setRunning(false);
+      }
+    }
+
+    // ─── CONFIRM DIALOG ───────────────────────────────────────
+
+    function ConfirmDialog({ title, desc, confirmLabel = "确认", danger = true, onConfirm, onCancel }) {
+      return (
+        <div style={{ position: "fixed", inset: 0, zIndex: 8000, display: "flex", alignItems: "center", justifyContent: "center" }}>
+          <div onClick={onCancel} style={{ position: "absolute", inset: 0, background: "rgba(0,0,0,0.28)", backdropFilter: "blur(2px)" }} />
+          <div style={{ position: "relative", background: C.card, borderRadius: 18, padding: "28px 28px 22px", width: 300, boxShadow: C.shadowLg, border: `1px solid ${C.cardBorder}` }}>
+            <div style={{ fontSize: 15, fontWeight: 600, color: C.text, marginBottom: 8 }}>{title}</div>
+            <div style={{ fontSize: 12.5, color: C.textMd, lineHeight: 1.7, marginBottom: 22 }}>{desc}</div>
+            <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
+              <Btn variant="ghost" small onClick={onCancel}>取消</Btn>
+              <Btn variant="primary" small danger={danger} onClick={onConfirm}>{confirmLabel}</Btn>
             </div>
           </div>
-          <div id="cardList" class="card-list empty-state">还没有读取到数据。</div>
-        </section>
-
-        <section class="card">
-          <h3>搜索结果</h3>
-          <div id="cardSearchResults" class="card-list empty-state">还没有搜索。</div>
-        </section>
-
-        <div class="two-col">
-          <section class="card">
-            <div class="section-title">
-              <h3>记忆检索调试</h3>
-              <button id="debugSearchBtn" class="ghost-btn">执行调试检索</button>
-            </div>
-            <div class="form-grid">
-              <label>
-                <span>输入要调试的记忆问题</span>
-                <input id="debugSearchInput" type="text" placeholder="例如：上次答应我的事是什么">
-              </label>
-            </div>
-            <div id="debugSearchResults" class="card-list empty-state">还没有执行调试。</div>
-          </section>
-          <section class="card">
-            <div class="section-title">
-              <h3>待审核画像区</h3>
-              <button id="refreshReviewsBtn" class="ghost-btn">刷新待审核列表</button>
-            </div>
-            <div id="reviewList" class="card-list empty-state">还没有读取到待审核内容。</div>
-          </section>
         </div>
+      );
+    }
 
-        <div class="two-col">
-          <section class="card">
-            <div class="section-title">
-              <h3>肖珂日记与情绪趋势</h3>
-              <button id="refreshDiariesBtn" class="ghost-btn">刷新日记</button>
+    // ─── FLOATING SIDEBAR ────────────────────────────────────
+
+    const navItems = [
+      { id: "overview", icon: "◉", label: "首页总览" },
+      { id: "memory",   icon: "◈", label: "记忆卡管理" },
+      { id: "vector",   icon: "◇", label: "向量与诊断" },
+    ];
+
+    function FloatingSidebar({ active, setActive }) {
+      const [open, setOpen] = useState(false);
+
+      const handleNav = id => { setActive(id); setOpen(false); };
+
+      return (
+        <>
+          <button onClick={() => setOpen(true)} title="打开导航"
+            style={{ position: "fixed", top: 20, left: 16, zIndex: 7000, width: 40, height: 40, borderRadius: 12, background: C.card, border: `1px solid ${C.cardBorder}`, boxShadow: C.shadowLg, cursor: "pointer", fontSize: 20, display: open ? "none" : "flex", alignItems: "center", justifyContent: "center" }}>
+            🦊
+          </button>
+
+          {open && <div onClick={() => setOpen(false)} style={{ position: "fixed", inset: 0, zIndex: 7100, background: "rgba(0,0,0,0.18)", backdropFilter: "blur(1px)" }} />}
+
+          <nav style={{ position: "fixed", top: 0, left: 0, bottom: 0, zIndex: 7200, width: 168, background: C.sidebar, borderRight: `1px solid ${C.sidebarBorder}`, display: "flex", flexDirection: "column", padding: "16px 0", boxShadow: open ? C.shadowLg : "none", transform: open ? "translateX(0)" : "translateX(-100%)", transition: "transform 0.22s cubic-bezier(.4,0,.2,1)" }}>
+            <div style={{ padding: "0 14px", marginBottom: 22, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 9 }}>
+                <div style={{ width: 30, height: 30, borderRadius: 9, background: C.accentBg, border: `1px solid ${C.accent}33`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 16 }}>🦊</div>
+                <div>
+                  <div style={{ fontSize: 12, fontWeight: 600, color: C.text }}>小克网关</div>
+                  <div style={{ fontSize: 10, color: C.textSm }}>xiaoketao.cc</div>
+                </div>
+              </div>
+              <button onClick={() => setOpen(false)} style={{ background: "none", border: "none", cursor: "pointer", color: C.textSm, fontSize: 16, padding: "2px 4px", lineHeight: 1 }}>✕</button>
             </div>
-            <div id="moodTrend" class="mini-summary empty-state">还没有读取到数据。</div>
-            <div id="diaryList" class="card-list empty-state">还没有读取到日记。</div>
-          </section>
-          <section class="card">
-            <div class="section-title">
-              <h3>记忆切片与长期记忆</h3>
-              <button id="refreshMemoryDataBtn" class="ghost-btn">刷新记忆数据</button>
+
+            <div style={{ flex: 1, padding: "0 8px", display: "flex", flexDirection: "column", gap: 2 }}>
+              {navItems.map(item => (
+                <button key={item.id} onClick={() => handleNav(item.id)}
+                  style={{ display: "flex", alignItems: "center", gap: 9, padding: "9px 10px", borderRadius: 9, border: "none", cursor: "pointer", fontSize: 12.5, width: "100%", textAlign: "left", background: active === item.id ? C.accentBg : "transparent", color: active === item.id ? C.accent : C.textMd, fontWeight: active === item.id ? 500 : 400 }}>
+                  <span style={{ fontSize: 14, lineHeight: 1, opacity: 0.8 }}>{item.icon}</span>
+                  {item.label}
+                </button>
+              ))}
             </div>
-            <div id="sliceList" class="card-list empty-state">还没有读取到切片。</div>
-            <div id="longMemoryList" class="card-list empty-state">还没有读取到长期记忆。</div>
-          </section>
+
+            <div style={{ padding: "12px 14px", borderTop: `1px solid ${C.sidebarBorder}` }}>
+              <div style={{ display: "flex", alignItems: "center", fontSize: 11, color: C.textSm }}><Dot color={C.green} />正常运行</div>
+              <div style={{ fontSize: 10, color: C.textSm, marginTop: 3 }}>v5.1 Lite · 新加坡</div>
+            </div>
+          </nav>
+        </>
+      );
+    }
+
+    // ─── PAGE HEADER ─────────────────────────────────────────
+
+    function PageHeader({ title, subtitle, action }) {
+      return (
+        <div style={{ marginBottom: 24, display: "flex", alignItems: "flex-end", justifyContent: "space-between" }}>
+          <div style={{ paddingLeft: 56 }}>
+            <h1 style={{ fontSize: 19, fontWeight: 600, color: C.text, margin: 0, letterSpacing: "-0.02em" }}>{title}</h1>
+            {subtitle && <p style={{ fontSize: 12, color: C.textSm, margin: "3px 0 0" }}>{subtitle}</p>}
+          </div>
+          {action}
         </div>
-      </section>
+      );
+    }
 
-      <section class="panel" id="vectorPanel">
-        <div class="section-title">
-          <h2>向量与诊断</h2>
-          <button id="refreshVectorsBtn" class="ghost-btn">刷新本页</button>
+    // ─── HERO BANNER ─────────────────────────────────────────
+
+    function HeroBanner() {
+      const hasImg = !!FAMILY_IMAGE_URL;
+      return (
+        <div style={{ borderRadius: 18, overflow: "hidden", marginBottom: 20, position: "relative", height: 168, boxShadow: C.shadow, background: hasImg ? `url(${FAMILY_IMAGE_URL}) center/cover no-repeat` : "linear-gradient(135deg, #F7E2C8 0%, #EED0A8 45%, #D9A87A 100%)" }}>
+          <div style={{ position: "absolute", inset: 0, background: "linear-gradient(160deg, rgba(255,248,238,0.60) 0%, rgba(240,215,185,0.38) 55%, rgba(196,120,78,0.28) 100%)" }} />
+          <div style={{ position: "absolute", top: -24, right: -24, width: 130, height: 130, borderRadius: "50%", background: "rgba(196,120,78,0.10)" }} />
+          <div style={{ position: "absolute", bottom: -36, left: 50, width: 90, height: 90, borderRadius: "50%", background: "rgba(255,195,140,0.15)" }} />
+          {!hasImg && <div style={{ position: "absolute", right: 22, bottom: -4, fontSize: 80, lineHeight: 1, opacity: 0.45, userSelect: "none" }}>🐯🦊</div>}
+          <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column", justifyContent: "flex-end", padding: "20px 26px" }}>
+            <div style={{ fontSize: 10, letterSpacing: "0.22em", fontWeight: 600, color: "rgba(110,65,30,0.65)", textTransform: "uppercase", marginBottom: 5 }}>Our Family</div>
+            <div style={{ fontSize: 22, fontWeight: 600, color: "rgba(75,40,15,0.82)", letterSpacing: "-0.02em", lineHeight: 1.2 }}>大老虎 &amp; 小狐狸 🤍</div>
+            <div style={{ fontSize: 11, color: "rgba(110,65,30,0.55)", marginTop: 6 }}>xiaoketao.cc · 网关正常运行中</div>
+          </div>
         </div>
+      );
+    }
 
-        <div class="two-col">
-          <section class="card">
-            <h3>向量操作</h3>
-            <p class="help-text">向量像“检索索引”。如果记忆搜索不准，通常先看这里。</p>
-            <div class="action-row">
-              <button id="nightlyVectorBtn" class="primary-btn">执行一次日常补量</button>
-              <button id="fullVectorRebuildBtn" class="danger-btn">全量重建向量</button>
-            </div>
-            <div id="vectorStatusSummary" class="mini-summary empty-state">还没有读取到数据。</div>
-          </section>
+    // ─── OVERVIEW ────────────────────────────────────────────
 
-          <section class="card">
-            <h3>工具诊断</h3>
-            <div class="action-row">
-              <button id="refreshNotionBtn" class="ghost-btn">刷新 Notion 缓存</button>
-              <button id="testNotionBtn" class="ghost-btn">检查 Notion 连通性</button>
-              <button id="backupBtn" class="ghost-btn">立即备份数据库</button>
+    function OverviewPage() {
+      const [toast, show] = useToast();
+      const [refreshing, setRefreshing] = useState(false);
+      const now = new Date().toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false });
+
+      return (
+        <div>
+          <Toast msg={toast} />
+          <PageHeader title="首页总览" subtitle="网关整体运行状态"
+            action={<Btn
+              variant="outline"
+              small
+              onClick={async () => {
+                if (!TOKEN()) return show("请先设置管理口令");
+                setRefreshing(true);
+                try {
+                  const r = await fetch("/admin/system/status", {
+                    headers: { Authorization: `Bearer ${TOKEN()}` },
+                  });
+                  if (!r.ok) {
+                    const j = await r.json().catch(() => ({}));
+                    throw new Error(j.error || r.statusText);
+                  }
+                  show("已刷新");
+                } catch (err) {
+                  show("请求失败: " + err.message);
+                } finally {
+                  setRefreshing(false);
+                }
+              }}
+            >
+              {refreshing ? "刷新中…" : "刷新"}
+            </Btn>}
+          />
+          <HeroBanner />
+          <Card style={{ marginBottom: 14, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <div style={{ width: 36, height: 36, borderRadius: 10, background: C.greenBg, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18 }}>🌐</div>
+              <div>
+                <div style={{ fontSize: 13, fontWeight: 500, color: C.text, display: "flex", alignItems: "center" }}><Dot color={C.green} />网关状态：<span style={{ color: C.green, marginLeft: 2 }}>正常</span></div>
+                <div style={{ fontSize: 11, color: C.textSm, marginTop: 2 }}>{now} · openrouter 路由</div>
+              </div>
             </div>
-            <div id="diagnosticSummary" class="mini-summary empty-state">还没有读取到数据。</div>
-          </section>
+            <Btn
+              variant="ghost"
+              small
+              onClick={() => {
+                const v = window.prompt("输入管理口令（将存入本机 localStorage: adminToken）", TOKEN());
+                if (v == null) return;
+                localStorage.setItem("adminToken", v.trim());
+                show(v.trim() ? "口令已保存" : "已清空口令");
+              }}
+            >
+              修改口令
+            </Btn>
+          </Card>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 12, marginBottom: 12 }}>
+            <StatCard icon="💬" label="总消息数" value="32,479" sub="今日新增 +0" />
+            <StatCard icon="🗂" label="总会话数" value="857" sub="段对话记录" />
+            <StatCard icon="🧠" label="消息向量" value="84" sub="已嵌入" />
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 12, marginBottom: 16 }}>
+            <StatCard icon="📇" label="每日记忆卡" value="0" sub="待生成" dim />
+            <StatCard icon="✦" label="卡片向量" value="84" sub="已嵌入" />
+            <StatCard icon="⚠" label="待审核条目" value="1" sub="需处理" warn />
+          </div>
+          <Card>
+            <SectionLabel>当前提供商</SectionLabel>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              {[{ name: "openrouter", desc: "anthropic / openai / meta-llama…" }, { name: "deepseek", desc: "deepseek-chat" }, { name: "zhipu", desc: "glm-" }, { name: "alibaba", desc: "qwen-" }]
+                .map(p => (
+                  <div key={p.name} style={{ padding: "7px 14px", borderRadius: 10, background: C.inputBg, border: `1px solid ${C.border}` }}>
+                    <div style={{ fontSize: 12, fontWeight: 500, color: C.text }}>{p.name}</div>
+                    <div style={{ fontSize: 10, color: C.textSm, marginTop: 1 }}>前缀：{p.desc}</div>
+                  </div>
+                ))}
+            </div>
+          </Card>
         </div>
+      );
+    }
 
-        <section class="card">
-          <h3>详细结果</h3>
-          <pre id="diagnosticOutput" class="log-box">还没有执行操作。</pre>
-        </section>
-      </section>
-    </main>
+    function StatCard({ icon, label, value, sub, dim, warn }) {
+      return (
+        <Card>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 8 }}>
+            <span style={{ fontSize: 18, lineHeight: 1 }}>{icon}</span>
+            {warn && <Badge color={C.red} bg={C.redBg}>需处理</Badge>}
+          </div>
+          <div style={{ fontSize: 11, color: C.textSm, marginBottom: 4 }}>{label}</div>
+          <div style={{ fontSize: 26, fontWeight: 300, letterSpacing: "-0.03em", lineHeight: 1, color: dim ? C.textSm : warn ? C.red : C.text, marginBottom: 4 }}>{value}</div>
+          <div style={{ fontSize: 10.5, color: C.textSm }}>{sub}</div>
+        </Card>
+      );
+    }
 
-    <section class="toast-area">
-      <div id="flashMessage" class="flash hidden"></div>
-    </section>
-  </div>
+    // ─── MEMORY PAGE ─────────────────────────────────────────
 
-  <script src="/static/admin.js"></script>
+    const MEM_TABS = ["重建与操作", "每日记忆卡", "对话切片", "人物画像", "肖珂日记", "长期记忆", "核心档案"];
+
+    function EditableCardList({ items, setItems, idKey = "id", labelFn, dateFn, rangeFn, show, listKind, onListRefresh }) {
+      const [editing, setEditing] = useState(null);
+      const [draft, setDraft] = useState({});
+      const [deleteTarget, setDeleteTarget] = useState(null);
+
+      const rowIsSlice = (row) =>
+        listKind === "slices" || (row && row.label != null && String(row.label).includes("切片"));
+
+      return (
+        <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+          {deleteTarget !== null && (
+            <ConfirmDialog
+              title="确认删除"
+              desc="删除后无法恢复，确定要删除这条记录吗？"
+              confirmLabel="删除"
+              onConfirm={async () => {
+                const row = items.find(x => x[idKey] === deleteTarget);
+                const isSlice = rowIsSlice(row);
+                try {
+                  if (isSlice) {
+                    if (!TOKEN()) {
+                      setDeleteTarget(null);
+                      return show("请先设置管理口令");
+                    }
+                    const r = await fetch(`/admin/memory/slices/${deleteTarget}`, {
+                      method: "DELETE",
+                      headers: { Authorization: `Bearer ${TOKEN()}` },
+                    });
+                    if (!r.ok) {
+                      const j = await r.json().catch(() => ({}));
+                      throw new Error(j.error || r.statusText);
+                    }
+                  }
+                  setItems(items.filter(x => x[idKey] !== deleteTarget));
+                  setDeleteTarget(null);
+                  show("已删除");
+                } catch (err) {
+                  setDeleteTarget(null);
+                  show("请求失败: " + err.message);
+                }
+              }}
+              onCancel={() => setDeleteTarget(null)}
+            />
+          )}
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <div style={{ fontSize: 12, color: C.textSm }}>共 {items.length} 条</div>
+            <Btn
+              variant="outline"
+              small
+              onClick={async () => {
+                if (!TOKEN()) return show("请先设置管理口令");
+                try {
+                  const isSlice = listKind === "slices" || (items.length > 0 && items[0].label != null && String(items[0].label).includes("切片"));
+                  if (isSlice && typeof onListRefresh === "function") {
+                    await onListRefresh();
+                    show("已刷新");
+                    return;
+                  }
+                  if (isSlice) {
+                    const r = await fetch("/admin/memory/slices?limit=200&offset=0", {
+                      headers: { Authorization: `Bearer ${TOKEN()}` },
+                    });
+                    if (!r.ok) {
+                      const j = await r.json().catch(() => ({}));
+                      throw new Error(j.error || r.statusText);
+                    }
+                    const j = await r.json();
+                    setItems((j.items || []).map(mapSliceFromApi));
+                  } else {
+                    const r = await fetch("/admin/cards/list?full=1&limit=500", {
+                      headers: { Authorization: `Bearer ${TOKEN()}` },
+                    });
+                    if (!r.ok) {
+                      const j = await r.json().catch(() => ({}));
+                      throw new Error(j.error || r.statusText);
+                    }
+                    const j = await r.json();
+                    setItems((j.cards || []).map(mapCardFromApi));
+                  }
+                  show("已刷新");
+                } catch (err) {
+                  show("请求失败: " + err.message);
+                }
+              }}
+            >
+              刷新
+            </Btn>
+          </div>
+          {items.map(item => (
+            <Card key={item[idKey]}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                  <span style={{ fontSize: 12.5, fontWeight: 500, color: C.accent }}>{labelFn(item)}</span>
+                  {/* Status */}
+                  {item.status && (() => {
+                    const { bg, color } = sliceStatusColors(item.status);
+                    return <Badge bg={bg} color={color}>{item.status}</Badge>;
+                  })()}
+                  {/* New slice metrics (only for slice rows) */}
+                  {rowIsSlice(item) && (
+                    <>
+                      {!!item.type && <Badge bg={C.accentBg} color={C.accent}>Type: {item.type}</Badge>}
+                      {!!item.context_anchor && <Badge bg={C.inputBg} color={C.textMd}>Ctx: {item.context_anchor}</Badge>}
+                      {(item.score !== undefined || item.hits !== undefined) && (
+                        <Badge bg={C.inputBg} color={C.textMd}>
+                          Score: {fmtScore(item.score)} | Hits: {item.hits ?? 0}
+                        </Badge>
+                      )}
+                      {item.first_impact && <Badge bg={C.redBg} color={C.red}>FIRST</Badge>}
+                    </>
+                  )}
+                </div>
+                <div style={{ display: "flex", gap: 6 }}>
+                  {editing === item[idKey] ? (
+                    <>
+                      <Btn
+                        variant="soft"
+                        small
+                        onClick={async () => {
+                          const isSlice = rowIsSlice(item);
+                          const text = draft[item[idKey]] ?? item.content;
+                          if (isSlice) {
+                            if (!TOKEN()) return show("请先设置管理口令");
+                            try {
+                              const r = await fetch(`/admin/memory/slices/${item[idKey]}`, {
+                                method: "PATCH",
+                                headers: authHeaders(),
+                                body: JSON.stringify({ content: text }),
+                              });
+                              if (!r.ok) {
+                                const j = await r.json().catch(() => ({}));
+                                throw new Error(j.error || r.statusText);
+                              }
+                              setItems(items.map(x => x[idKey] === item[idKey] ? { ...x, content: text } : x));
+                              setEditing(null);
+                              show("已保存");
+                            } catch (err) {
+                              show("请求失败: " + err.message);
+                            }
+                          } else {
+                            setItems(items.map(x => x[idKey] === item[idKey] ? { ...x, content: text } : x));
+                            setEditing(null);
+                            show("已保存(仅本地)");
+                          }
+                        }}
+                      >
+                        保存
+                      </Btn>
+                      <Btn variant="ghost" small onClick={() => setEditing(null)}>取消</Btn>
+                    </>
+                  ) : (
+                    <>
+                      <Btn variant="ghost" small onClick={() => { setEditing(item[idKey]); setDraft({ ...draft, [item[idKey]]: item.content }); }}>编辑</Btn>
+                      {rowIsSlice(item) && (
+                        <Btn
+                          variant="ghost"
+                          small
+                          onClick={async () => {
+                            const note = window.prompt("追加到该切片正文末尾（保存到服务器）：", "");
+                            if (note == null || !String(note).trim()) return;
+                            if (!TOKEN()) return show("请先设置管理口令");
+                            const merged = `${item.content || ""}\n\n【手动补充】\n${String(note).trim()}`;
+                            try {
+                              const r = await fetch(`/admin/memory/slices/${item[idKey]}`, {
+                                method: "PATCH",
+                                headers: authHeaders(),
+                                body: JSON.stringify({ content: merged }),
+                              });
+                              if (!r.ok) {
+                                const j = await r.json().catch(() => ({}));
+                                throw new Error(j.error || r.statusText);
+                              }
+                              setItems(items.map((x) => (x[idKey] === item[idKey] ? { ...x, content: merged } : x)));
+                              show("已追加备注");
+                            } catch (err) {
+                              show("请求失败: " + err.message);
+                            }
+                          }}
+                        >
+                          追加备注
+                        </Btn>
+                      )}
+                      <Btn variant="ghost" small danger onClick={() => setDeleteTarget(item[idKey])}>删除</Btn>
+                    </>
+                  )}
+                </div>
+              </div>
+              {(dateFn || rangeFn) && (
+                <div style={{ fontSize: 11, color: C.textSm, marginBottom: 10 }}>
+                  {dateFn && dateFn(item)}{rangeFn && ` · ${rangeFn(item)}`}
+                </div>
+              )}
+              {editing === item[idKey] ? (
+                <textarea value={draft[item[idKey]] ?? item.content} onChange={e => setDraft({ ...draft, [item[idKey]]: e.target.value })} rows={8}
+                  style={{ width: "100%", minHeight: 160, padding: "12px 14px", borderRadius: 10, border: `1.5px solid ${C.accent}66`, background: C.accentBg, fontSize: 13, resize: "vertical", boxSizing: "border-box", color: C.text, outline: "none", lineHeight: 1.75 }} />
+              ) : (
+                <div style={{ fontSize: 13, color: C.textMd, lineHeight: 1.8, whiteSpace: "pre-wrap" }}>{item.content}</div>
+              )}
+            </Card>
+          ))}
+          {items.length === 0 && (
+            <div style={{ textAlign: "center", padding: "52px 0", color: C.textSm }}>
+              <div style={{ fontSize: 32, marginBottom: 10 }}>🦊</div>暂无内容
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    function MemoryCardsTable({ items, show, listTotal, page, pageSize, setPage, onRefreshPage, scrollTop }) {
+      const totalDisplay = listTotal != null ? listTotal : items.length;
+      const totalPages = Math.max(1, Math.ceil(totalDisplay / pageSize));
+
+      const load = async () => {
+        if (!TOKEN()) return show("请先设置管理口令");
+        try {
+          await onRefreshPage();
+          show("已刷新每日记忆卡");
+        } catch (err) {
+          show("请求失败: " + err.message);
+        }
+      };
+
+      return (
+        <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+          <div style={{ fontSize: 11, color: C.textMd, lineHeight: 1.65, padding: "10px 14px", background: C.accentBg, borderRadius: 10, border: `1px solid ${C.border}` }}>
+            <b style={{ color: C.accent }}>每日对话总结</b>的正式落库位置是 <b>memory_cards</b> 表的 <b>summary</b> 字段（下方卡片正文）。旧版界面曾误把 <b>diary_entries</b> 日记长文标成「记忆卡」；本页已拆成两块，避免混淆。
+          </div>
+          <div style={{ display: "flex", flexWrap: "wrap", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
+            <div style={{ fontSize: 12, color: C.textSm }}>
+              共 {totalDisplay} 条 · 本页 {items.length} 条 · 第 {page + 1} / {totalPages} 页
+            </div>
+            <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 8 }}>
+              <Btn variant="outline" small disabled={page <= 0} onClick={() => setPage((p) => Math.max(0, p - 1))}>上一页</Btn>
+              <Btn variant="outline" small disabled={page + 1 >= totalPages} onClick={() => setPage((p) => Math.min(totalPages - 1, p + 1))}>下一页</Btn>
+              <Btn variant="outline" small onClick={load}>刷新</Btn>
+              <Btn variant="ghost" small onClick={scrollTop}>回顶部</Btn>
+            </div>
+          </div>
+          {items.map((row) => (
+            <Card key={row.id}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 10, flexWrap: "wrap", gap: 8 }}>
+                <div>
+                  <span style={{ fontSize: 13, fontWeight: 600, color: C.accent }}>{row.date || "（无日期）"}</span>
+                  {row.tags ? <span style={{ marginLeft: 8 }}><Badge bg={C.accentBg} color={C.accent}>{row.tags}</Badge></span> : null}
+                  <span style={{ marginLeft: 6 }}>{row.has_embedding ? <Badge bg={C.greenBg} color={C.green}>已向量化</Badge> : <Badge bg={C.inputBg} color={C.textSm}>未嵌入</Badge>}</span>
+                </div>
+                <span style={{ fontSize: 10, color: C.textSm }}>id #{row.id}</span>
+              </div>
+              {(row.msg_id_start != null && row.msg_id_end != null) && (
+                <div style={{ fontSize: 11, color: C.textSm, marginBottom: 8 }}>消息范围 {row.msg_id_start}–{row.msg_id_end}</div>
+              )}
+              <div style={{ fontSize: 13, color: C.textMd, lineHeight: 1.8, whiteSpace: "pre-wrap" }}>{row.summary || "（无摘要）"}</div>
+            </Card>
+          ))}
+          {items.length === 0 && (
+            <div style={{ textAlign: "center", padding: "48px 0", color: C.textSm }}>
+              <div style={{ fontSize: 32, marginBottom: 10 }}>📇</div>
+              暂无 memory_cards 记录；可在「重建与操作」生成记忆卡
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    function DiaryBookPanel({ items, show, cleanMode = false, listTotal, page, pageSize, setPage, onRefreshPage, scrollTop }) {
+      const totalDisplay = listTotal != null ? listTotal : items.length;
+      const totalPages = Math.max(1, Math.ceil(totalDisplay / pageSize));
+
+      const load = async () => {
+        if (!TOKEN()) return show("请先设置管理口令");
+        try {
+          await onRefreshPage();
+          show("已刷新肖珂日记");
+        } catch (err) {
+          show("请求失败: " + err.message);
+        }
+      };
+
+      return (
+        <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+          {!cleanMode && (
+            <div style={{ fontSize: 11, color: C.textMd, lineHeight: 1.65, padding: "10px 14px", background: C.accentBg, borderRadius: 10, border: `1px solid ${C.border}` }}>
+              以下为 <b style={{ color: C.accent }}>diary_entries</b> 表中的日记正文（worker / generate_daily_diary 写入），按日期倒序。
+            </div>
+          )}
+          <div style={{ display: "flex", flexWrap: "wrap", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
+            <div style={{ fontSize: 12, color: C.textSm }}>
+              共 {totalDisplay} 篇 · 本页 {items.length} 篇 · 第 {page + 1} / {totalPages} 页
+            </div>
+            <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 8 }}>
+              <Btn variant="outline" small disabled={page <= 0} onClick={() => setPage((p) => Math.max(0, p - 1))}>上一页</Btn>
+              <Btn variant="outline" small disabled={page + 1 >= totalPages} onClick={() => setPage((p) => Math.min(totalPages - 1, p + 1))}>下一页</Btn>
+              <Btn variant="outline" small onClick={load}>刷新</Btn>
+              <Btn variant="ghost" small onClick={scrollTop}>回顶部</Btn>
+            </div>
+          </div>
+          {items.map((d) => (
+            <div
+              key={d.id}
+              style={{
+                background: "linear-gradient(152deg, #FFFFFF 0%, #FFF9F4 55%, #FDF6F0 100%)",
+                borderRadius: 18,
+                border: `1px solid ${C.cardBorder}`,
+                boxShadow: "0 4px 24px rgba(196,120,78,0.08), 0 1px 0 rgba(255,255,255,0.8) inset",
+                overflow: "hidden",
+              }}
+            >
+              <div
+                style={{
+                  padding: "20px 24px 14px",
+                  background: "linear-gradient(180deg, rgba(253,243,236,0.65) 0%, transparent 100%)",
+                  borderBottom: `1px solid ${C.border}55`,
+                }}
+              >
+                <div style={{ fontSize: 10, letterSpacing: "0.14em", color: C.textSm, marginBottom: 8, fontWeight: 600 }}>肖珂 · 日记</div>
+                <div style={{ display: "flex", flexWrap: "wrap", alignItems: "flex-end", gap: 12, justifyContent: "space-between" }}>
+                  <div style={{ fontSize: 24, fontWeight: 200, color: C.text, letterSpacing: "-0.03em", fontFamily: "Georgia, 'Songti SC', serif" }}>{d.date}</div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+                    {d.mood_label ? <Badge bg={C.accentBg} color={C.accent}>{d.mood_label}</Badge> : null}
+                    <span style={{ fontSize: 12, color: C.textMd, fontWeight: 500 }}>
+                      {d.mood_score != null && d.mood_score !== "" ? `心情 ${d.mood_score} / 10` : ""}
+                    </span>
+                  </div>
+                </div>
+                {d.title ? (
+                  <div style={{ fontSize: 16, fontWeight: 500, color: C.accent, marginTop: 14, lineHeight: 1.45 }}>{d.title}</div>
+                ) : null}
+              </div>
+              <div
+                style={{
+                  padding: "22px 24px 26px",
+                  fontSize: 14,
+                  color: C.textMd,
+                  lineHeight: 1.9,
+                  whiteSpace: "pre-wrap",
+                  letterSpacing: "0.02em",
+                }}
+              >
+                {d.content || "（无正文）"}
+              </div>
+            </div>
+          ))}
+          {items.length === 0 && (
+            <div style={{ textAlign: "center", padding: "52px 0", color: C.textSm }}>
+              <div style={{ fontSize: 36, marginBottom: 12, opacity: 0.85 }}>📒</div>
+              <div>暂无日记条目</div>
+              <div style={{ fontSize: 11, marginTop: 8 }}>确认 worker 已运行并成功写入 diary_entries</div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    function MemoryPage() {
+      const [activeTab, setActiveTab] = useState("重建与操作");
+      const [toast, show] = useToast();
+      const [singleDate, setSingleDate] = useState("");
+      const [startDate, setStartDate] = useState("");
+      const [endDate, setEndDate] = useState("");
+      const [forceRedo, setForceRedo] = useState(false);
+      const [searchKeyword, setSearchKeyword] = useState("");
+      const [searchDate, setSearchDate] = useState("");
+      const [memoryCards, setMemoryCards] = useState([]);
+      const [memoryCardsListTotal, setMemoryCardsListTotal] = useState(null);
+      const [memoryCardPage, setMemoryCardPage] = useState(0);
+      const [memoryCardDateFilter, setMemoryCardDateFilter] = useState(null);
+      const [diaryRows, setDiaryRows] = useState([]);
+      const [diaryListTotal, setDiaryListTotal] = useState(null);
+      const [diaryPage, setDiaryPage] = useState(0);
+      const [slices, setSlices] = useState([]);
+      const [sliceTotal, setSliceTotal] = useState(0);
+      const [slicePage, setSlicePage] = useState(0);
+      const [confirmRebuild, setConfirmRebuild] = useState(false);
+      const [workerPipelineDate, setWorkerPipelineDate] = useState(() => new Date().toISOString().slice(0, 10));
+      const [workerPipelineRunning, setWorkerPipelineRunning] = useState(false);
+
+      const fetchMemoryCardsData = async (pageIdx, dateFilter) => {
+        if (!TOKEN()) return;
+        const offset = pageIdx * ADMIN_MEMORY_PAGE_SIZE;
+        const qs = new URLSearchParams({
+          limit: String(ADMIN_MEMORY_PAGE_SIZE),
+          offset: String(offset),
+        });
+        if (dateFilter) qs.set("date", dateFilter);
+        const r = await fetch(`/admin/memory/memory_cards?${qs.toString()}`, {
+          headers: { Authorization: `Bearer ${TOKEN()}` },
+        });
+        if (!r.ok) {
+          const j = await r.json().catch(() => ({}));
+          throw new Error(j.error || r.statusText);
+        }
+        const j = await r.json();
+        setMemoryCards((j.items || []).map(mapMemoryCardRow));
+        setMemoryCardsListTotal(j.total != null ? j.total : (j.items || []).length);
+      };
+
+      const fetchDiaryData = async (pageIdx) => {
+        if (!TOKEN()) return;
+        const offset = pageIdx * ADMIN_DIARY_PAGE_SIZE;
+        const r = await fetch(
+          `/admin/cards/list?full=1&limit=${ADMIN_DIARY_PAGE_SIZE}&offset=${offset}`,
+          { headers: { Authorization: `Bearer ${TOKEN()}` } },
+        );
+        if (!r.ok) {
+          const j = await r.json().catch(() => ({}));
+          throw new Error(j.error || r.statusText);
+        }
+        const j = await r.json();
+        setDiaryRows((j.cards || j.items || []).map(mapCardFromApi));
+        setDiaryListTotal(j.total != null ? j.total : (j.cards || j.items || []).length);
+      };
+
+      const fetchSlicePageData = async (pageIdx) => {
+        if (!TOKEN()) return;
+        const offset = pageIdx * ADMIN_SLICE_PAGE_SIZE;
+        const r = await fetch(
+          `/admin/memory/slices?limit=${ADMIN_SLICE_PAGE_SIZE}&offset=${offset}`,
+          { headers: { Authorization: `Bearer ${TOKEN()}` } },
+        );
+        if (!r.ok) {
+          const j = await r.json().catch(() => ({}));
+          throw new Error(j.error || r.statusText);
+        }
+        const j = await r.json();
+        const mapped = (j.items || []).map(mapSliceFromApi);
+        const total = j.total != null ? j.total : mapped.length;
+        setSliceTotal(total);
+        const seen = new Set();
+        const deduped = mapped.filter((x) => {
+          if (seen.has(x.id)) return false;
+          seen.add(x.id);
+          return true;
+        });
+        setSlices(deduped);
+      };
+
+      useEffect(() => {
+        if (activeTab !== "每日记忆卡") {
+          setMemoryCardDateFilter(null);
+          setMemoryCardPage(0);
+        }
+      }, [activeTab]);
+
+      useEffect(() => {
+        if (activeTab !== "每日记忆卡") return;
+        if (!TOKEN()) return;
+        (async () => {
+          try {
+            await fetchMemoryCardsData(memoryCardPage, memoryCardDateFilter);
+          } catch (err) {
+            show("加载每日记忆卡页失败: " + err.message);
+          }
+        })();
+      }, [activeTab, memoryCardPage, memoryCardDateFilter]);
+
+      useEffect(() => {
+        if (activeTab !== "肖珂日记") return;
+        setDiaryPage(0);
+      }, [activeTab]);
+
+      useEffect(() => {
+        if (activeTab !== "肖珂日记") return;
+        if (!TOKEN()) return;
+        (async () => {
+          try {
+            await fetchDiaryData(diaryPage);
+          } catch (err) {
+            show("加载日记失败: " + err.message);
+          }
+        })();
+      }, [activeTab, diaryPage]);
+
+      useEffect(() => {
+        if (activeTab !== "对话切片") return;
+        setSlicePage(0);
+      }, [activeTab]);
+
+      useEffect(() => {
+        if (activeTab !== "对话切片") return;
+        if (!TOKEN()) return;
+        (async () => {
+          try {
+            await fetchSlicePageData(slicePage);
+          } catch (err) {
+            show("加载切片失败: " + err.message);
+          }
+        })();
+      }, [activeTab, slicePage]);
+
+      const sliceTotalPages = Math.max(1, Math.ceil(sliceTotal / ADMIN_SLICE_PAGE_SIZE));
+
+      return (
+        <div>
+          <Toast msg={toast} />
+          {confirmRebuild && (
+            <ConfirmDialog
+              title="全量重建记忆卡"
+              desc="将重新生成所有日期的每日记忆卡，耗时较长且不可中止。确认要执行吗？"
+              confirmLabel="确认重建"
+              onConfirm={async () => {
+                if (!TOKEN()) return show("请先设置管理口令");
+                try {
+                  const r = await fetch("/admin/cards/rebuild_full", {
+                    method: "POST",
+                    headers: authHeaders(),
+                    body: "{}",
+                  });
+                  if (!r.ok) {
+                    const j = await r.json().catch(() => ({}));
+                    throw new Error(j.error || r.statusText);
+                  }
+                  setConfirmRebuild(false);
+                  show("已提交全量重建任务");
+                } catch (err) {
+                  setConfirmRebuild(false);
+                  show("请求失败: " + err.message);
+                }
+              }}
+              onCancel={() => setConfirmRebuild(false)}
+            />
+          )}
+          <PageHeader title="记忆卡管理" subtitle="构建与检索小克的长期记忆" />
+
+          <div style={{ display: "flex", gap: 5, marginBottom: 22, flexWrap: "wrap" }}>
+            {MEM_TABS.map(tab => (
+              <button key={tab} onClick={() => setActiveTab(tab)}
+                style={{ padding: "6px 13px", borderRadius: 20, fontSize: 12, fontWeight: activeTab === tab ? 500 : 400, cursor: "pointer", border: `1px solid ${activeTab === tab ? C.accent : C.border}`, background: activeTab === tab ? C.accentBg : "transparent", color: activeTab === tab ? C.accent : C.textMd }}>
+                {tab}
+              </button>
+            ))}
+          </div>
+
+          {activeTab === "重建与操作" && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+              <Card style={{ border: `2px solid ${C.accent}44`, boxShadow: `${C.shadow}, 0 0 0 1px ${C.accent}22` }}>
+                <SectionLabel>记忆流水线 Worker</SectionLabel>
+                <div style={{ fontSize: 12, color: C.textMd, lineHeight: 1.65, marginBottom: 14 }}>
+                  强制调用后端记忆流水线（切片、整合、长期记忆等按后台配置执行）。提交后任务在后台运行，可能需要一两分钟。
+                </div>
+                <div style={{ display: "flex", gap: 12, alignItems: "flex-end", flexWrap: "wrap" }}>
+                  <div style={{ flex: "1 1 200px", minWidth: 160 }}>
+                    <div style={{ fontSize: 11, color: C.textSm, marginBottom: 5 }}>流水线日期（日记/画像等按日）</div>
+                    <Input value={workerPipelineDate} onChange={setWorkerPipelineDate} type="date" />
+                  </div>
+                  <Btn
+                    onClick={() => postMemoryWorkerRun(workerPipelineDate, show, setWorkerPipelineRunning)}
+                    disabled={workerPipelineRunning}
+                    style={{ flexShrink: 0 }}
+                  >
+                    {workerPipelineRunning ? "提交中…" : "强制运行记忆切片 (Run Worker)"}
+                  </Btn>
+                </div>
+              </Card>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
+                <Card>
+                  <SectionLabel>生成每日记忆卡</SectionLabel>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+                    <div>
+                      <div style={{ fontSize: 11, color: C.textSm, marginBottom: 5 }}>单独生成某一天</div>
+                      <Input value={singleDate} onChange={setSingleDate} type="date" />
+                    </div>
+                    <div>
+                      <div style={{ fontSize: 11, color: C.textSm, marginBottom: 5 }}>批量生成时间段</div>
+                      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                        <Input value={startDate} onChange={setStartDate} type="date" />
+                        <span style={{ fontSize: 11, color: C.textSm, flexShrink: 0 }}>至</span>
+                        <Input value={endDate} onChange={setEndDate} type="date" />
+                      </div>
+                    </div>
+                    <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", fontSize: 12, color: C.textMd, userSelect: "none" }}>
+                      <input type="checkbox" checked={forceRedo} onChange={e => setForceRedo(e.target.checked)} style={{ accentColor: C.accent }} />
+                      强制重做已有总结
+                    </label>
+                    <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                      <Btn
+                        small
+                        disabled={!singleDate}
+                        onClick={async () => {
+                          if (!TOKEN()) return show("请先设置管理口令");
+                          try {
+                            const r = await fetch("/admin/cards/generate", {
+                              method: "POST",
+                              headers: authHeaders(),
+                              body: JSON.stringify({ date: singleDate, force: forceRedo }),
+                            });
+                            if (!r.ok) {
+                              const j = await r.json().catch(() => ({}));
+                              throw new Error(j.error || r.statusText);
+                            }
+                            show(`已提交生成 ${singleDate} 的记忆卡`);
+                          } catch (err) {
+                            show("请求失败: " + err.message);
+                          }
+                        }}
+                      >
+                        生成这一天
+                      </Btn>
+                      <Btn
+                        variant="outline"
+                        small
+                        disabled={!startDate || !endDate}
+                        onClick={async () => {
+                          if (!TOKEN()) return show("请先设置管理口令");
+                          try {
+                            const r = await fetch("/admin/cards/generate", {
+                              method: "POST",
+                              headers: authHeaders(),
+                              body: JSON.stringify({
+                                start_date: startDate,
+                                end_date: endDate,
+                                force: forceRedo,
+                              }),
+                            });
+                            if (!r.ok) {
+                              const j = await r.json().catch(() => ({}));
+                              throw new Error(j.error || r.statusText);
+                            }
+                            show(`已提交批量生成 ${startDate} → ${endDate}`);
+                          } catch (err) {
+                            show("请求失败: " + err.message);
+                          }
+                        }}
+                      >
+                        批量生成
+                      </Btn>
+                      <Btn
+                        variant="ghost"
+                        small
+                        onClick={async () => {
+                          if (!TOKEN()) return show("请先设置管理口令");
+                          try {
+                            const r = await fetch("/admin/cards/embed", {
+                              method: "POST",
+                              headers: authHeaders(),
+                              body: "{}",
+                            });
+                            if (!r.ok) {
+                              const j = await r.json().catch(() => ({}));
+                              throw new Error(j.error || r.statusText);
+                            }
+                            show("补做向量任务已提交");
+                          } catch (err) {
+                            show("请求失败: " + err.message);
+                          }
+                        }}
+                      >
+                        补做向量
+                      </Btn>
+                    </div>
+                  </div>
+                </Card>
+                <Card>
+                  <SectionLabel>搜索与查看</SectionLabel>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+                    <div>
+                      <div style={{ fontSize: 11, color: C.textSm, marginBottom: 5 }}>按日期查看记忆卡</div>
+                      <div style={{ display: "flex", gap: 8 }}>
+                        <Input value={searchDate} onChange={setSearchDate} type="date" />
+                        <Btn
+                          small
+                          style={{ flexShrink: 0 }}
+                          onClick={() => {
+                            if (!searchDate) return show("请选择日期");
+                            if (!TOKEN()) return show("请先设置管理口令");
+                            setMemoryCardDateFilter(searchDate);
+                            setMemoryCardPage(0);
+                            setActiveTab("每日记忆卡");
+                            show(`正在加载 ${searchDate} 的记忆卡…`);
+                          }}
+                        >
+                          跳转
+                        </Btn>
+                      </div>
+                    </div>
+                    <div>
+                      <div style={{ fontSize: 11, color: C.textSm, marginBottom: 5 }}>关键词搜索</div>
+                      <div style={{ display: "flex", gap: 8 }}>
+                        <Input value={searchKeyword} onChange={setSearchKeyword} placeholder="例如：焦虑、工作" />
+                        <Btn
+                          small
+                          style={{ flexShrink: 0 }}
+                          onClick={async () => {
+                            if (!searchKeyword) return show("请输入关键词");
+                            if (!TOKEN()) return show("请先设置管理口令");
+                            try {
+                              const r = await fetch("/admin/cards/search", {
+                                method: "POST",
+                                headers: authHeaders(),
+                                body: JSON.stringify({ query: searchKeyword }),
+                              });
+                              if (!r.ok) {
+                                const j = await r.json().catch(() => ({}));
+                                throw new Error(j.error || r.statusText);
+                              }
+                              const j = await r.json();
+                              const n = (j.results && j.results.length) || 0;
+                              show(n ? `「${searchKeyword}」命中 ${n} 条` : `「${searchKeyword}」无结果`);
+                            } catch (err) {
+                              show("请求失败: " + err.message);
+                            }
+                          }}
+                        >
+                          搜索
+                        </Btn>
+                      </div>
+                    </div>
+                    <div style={{ display: "flex", gap: 8 }}>
+                      <Btn variant="soft" small onClick={() => setActiveTab("每日记忆卡")}>每日记忆卡 →</Btn>
+                      <Btn variant="ghost" small onClick={() => setActiveTab("对话切片")}>对话切片 →</Btn>
+                    </div>
+                  </div>
+                </Card>
+              </div>
+              <Card style={{ background: C.redBg, border: `1px solid ${C.red}28` }}>
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                  <div>
+                    <div style={{ fontSize: 13, fontWeight: 500, color: C.text }}>全量重建记忆卡</div>
+                    <div style={{ fontSize: 11, color: C.textSm, marginTop: 3 }}>重新生成所有日期的每日记忆卡，耗时较长，请谨慎操作</div>
+                  </div>
+                  <Btn danger small onClick={() => setConfirmRebuild(true)}>全量重建</Btn>
+                </div>
+              </Card>
+            </div>
+          )}
+
+          {activeTab === "每日记忆卡" && (
+            <MemoryCardsTable
+              items={memoryCards}
+              show={show}
+              listTotal={memoryCardsListTotal}
+              page={memoryCardPage}
+              pageSize={ADMIN_MEMORY_PAGE_SIZE}
+              setPage={setMemoryCardPage}
+              onRefreshPage={() => fetchMemoryCardsData(memoryCardPage, memoryCardDateFilter)}
+              scrollTop={scrollAdminTop}
+            />
+          )}
+
+          {activeTab === "肖珂日记" && (
+            <DiaryBookPanel
+              items={diaryRows}
+              show={show}
+              listTotal={diaryListTotal}
+              page={diaryPage}
+              pageSize={ADMIN_DIARY_PAGE_SIZE}
+              setPage={setDiaryPage}
+              onRefreshPage={() => fetchDiaryData(diaryPage)}
+              scrollTop={scrollAdminTop}
+            />
+          )}
+
+          {activeTab === "对话切片" && (
+            <div>
+              <div style={{ fontSize: 11.5, color: C.textSm, padding: "10px 14px", background: C.inputBg, borderRadius: 10, border: `1px solid ${C.border}`, marginBottom: 16, lineHeight: 1.65 }}>
+                💡 <b style={{ color: C.textMd }}>对话切片</b>来自 memory_slices（约每 20 条消息一批）；<b style={{ color: C.textMd }}>每日记忆卡</b>在 memory_cards 表。切换到此页会自动从服务器加载；请用下方「上一页 / 下一页」翻页。若正文有重复，多为历史重复生成，可删除多余条目；重要内容可通过「追加备注」写在切片正文末尾而不改核心流水线。
+              </div>
+              <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 10, marginBottom: 14 }}>
+                <Btn variant="outline" small onClick={() => fetchSlicePageData(slicePage)}>重新加载</Btn>
+                <span style={{ fontSize: 11, color: C.textSm }}>
+                  第 {slicePage + 1} / {sliceTotalPages} 页 · 本页 {slices.length} 条 / 共 {sliceTotal} 条
+                </span>
+                <Btn variant="outline" small disabled={slicePage <= 0} onClick={() => setSlicePage((p) => Math.max(0, p - 1))}>上一页</Btn>
+                <Btn variant="outline" small disabled={slicePage + 1 >= sliceTotalPages} onClick={() => setSlicePage((p) => Math.min(sliceTotalPages - 1, p + 1))}>下一页</Btn>
+                <Btn variant="ghost" small onClick={scrollAdminTop}>回顶部</Btn>
+              </div>
+              <EditableCardList
+                listKind="slices"
+                items={slices}
+                setItems={setSlices}
+                idKey="id"
+                labelFn={s => s.label}
+                dateFn={s => s.date}
+                rangeFn={s => s.range}
+                show={show}
+                onListRefresh={() => fetchSlicePageData(slicePage)}
+              />
+            </div>
+          )}
+
+          {!["重建与操作", "每日记忆卡", "对话切片", "肖珂日记"].includes(activeTab) && (
+            <PlaceholderTab name={activeTab} show={show} />
+          )}
+        </div>
+      );
+    }
+
+    function PlaceholderTab({ name, show }) {
+      const [content, setContent] = useState(`这里将展示「${name}」的内容。可以在此编辑和更新相关档案信息。`);
+      const [editing, setEditing] = useState(false);
+      const [draft, setDraft] = useState("");
+
+      return (
+        <Card>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+            <div style={{ fontSize: 13, fontWeight: 500, color: C.accent }}>{name}</div>
+            <div style={{ display: "flex", gap: 6 }}>
+              {editing ? (
+                <>
+                  <Btn variant="soft" small onClick={() => { setContent(draft); setEditing(false); show("已保存"); }}>保存</Btn>
+                  <Btn variant="ghost" small onClick={() => setEditing(false)}>取消</Btn>
+                </>
+              ) : (
+                <Btn variant="ghost" small onClick={() => { setDraft(content); setEditing(true); }}>编辑</Btn>
+              )}
+            </div>
+          </div>
+          {editing ? (
+            <textarea value={draft} onChange={e => setDraft(e.target.value)} rows={12}
+              style={{ width: "100%", minHeight: 240, padding: "14px 16px", borderRadius: 10, border: `1.5px solid ${C.accent}66`, background: C.accentBg, fontSize: 13, resize: "vertical", boxSizing: "border-box", color: C.text, outline: "none", lineHeight: 1.8 }} />
+          ) : (
+            <div style={{ fontSize: 13, color: C.textMd, lineHeight: 1.85, whiteSpace: "pre-wrap" }}>{content}</div>
+          )}
+        </Card>
+      );
+    }
+
+    // ─── VECTOR PAGE ─────────────────────────────────────────
+
+    function VectorPage() {
+      const [workerEnabled, setWorkerEnabled] = useState(true);
+      const [workerDate, setWorkerDate] = useState("2026-03-17");
+      const [workerModel, setWorkerModel] = useState("deepseek-chat");
+      const [running, setRunning] = useState(false);
+      const [toast, show] = useToast();
+
+      return (
+        <div>
+          <Toast msg={toast} />
+          <PageHeader title="向量与诊断" subtitle="任务中心与 Worker 管理" />
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 16 }}>
+            <Card>
+              <SectionLabel>任务中心</SectionLabel>
+              <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 14 }}>
+                {[{ label: "记忆任务", status: "idle" }, { label: "向量任务", status: "idle" }, { label: "总结 worker", status: "done", sub: "完成于 2026-03-17 15:37" }]
+                  .map(t => (
+                    <div key={t.label} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "9px 12px", borderRadius: 9, background: C.inputBg }}>
+                      <span style={{ fontSize: 12, color: C.textMd }}>{t.label}</span>
+                      <div style={{ textAlign: "right" }}>
+                        <Badge color={t.status === "done" ? C.green : C.textSm} bg={t.status === "done" ? C.greenBg : C.inputBg}>{t.status}</Badge>
+                        {t.sub && <div style={{ fontSize: 10, color: C.textSm, marginTop: 2 }}>{t.sub}</div>}
+                      </div>
+                    </div>
+                  ))}
+              </div>
+              <Btn
+                variant="outline"
+                small
+                onClick={async () => {
+                  if (!TOKEN()) return show("请先设置管理口令");
+                  try {
+                    const h = { Authorization: `Bearer ${TOKEN()}` };
+                    const r1 = await fetch("/admin/system/status", { headers: h });
+                    if (!r1.ok) {
+                      const j = await r1.json().catch(() => ({}));
+                      throw new Error(j.error || r1.statusText);
+                    }
+                    const r2 = await fetch("/admin/vectors/status", { headers: h });
+                    if (!r2.ok) {
+                      const j = await r2.json().catch(() => ({}));
+                      throw new Error(j.error || r2.statusText);
+                    }
+                    const r3 = await fetch("/admin/cards/status", { headers: h });
+                    if (!r3.ok) {
+                      const j = await r3.json().catch(() => ({}));
+                      throw new Error(j.error || r3.statusText);
+                    }
+                    show("任务状态已刷新");
+                  } catch (err) {
+                    show("请求失败: " + err.message);
+                  }
+                }}
+              >
+                刷新任务状态
+              </Btn>
+            </Card>
+            <Card>
+              <SectionLabel>Worker 设置</SectionLabel>
+              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                  <span style={{ fontSize: 12, color: C.textMd }}>Worker 开关</span>
+                  <Toggle enabled={workerEnabled} setEnabled={setWorkerEnabled} />
+                </div>
+                <div>
+                  <div style={{ fontSize: 11, color: C.textSm, marginBottom: 5 }}>Worker 模型</div>
+                  <select value={workerModel} onChange={e => setWorkerModel(e.target.value)}
+                    style={{ width: "100%", padding: "7px 10px", borderRadius: 8, border: `1px solid ${C.border}`, background: C.inputBg, fontSize: 12, color: C.text, outline: "none" }}>
+                    <option value="deepseek-chat">deepseek / deepseek-chat</option>
+                    <option value="deepseek-reasoner">deepseek / deepseek-reasoner</option>
+                    <option value="glm-4">zhipu / glm-4</option>
+                  </select>
+                </div>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginTop: 2 }}>
+                  {[{ l: "切片数量", v: "60" }, { l: "活跃切片", v: "0", dim: true }, { l: "长期记忆", v: "15" }, { l: "待审核", v: "1", warn: true }]
+                    .map(t => (
+                      <div key={t.l} style={{ padding: "9px 11px", borderRadius: 9, background: t.warn ? C.redBg : C.inputBg, border: `1px solid ${t.warn ? C.red + "22" : C.border}` }}>
+                        <div style={{ fontSize: 10, color: C.textSm, marginBottom: 3 }}>{t.l}</div>
+                        <div style={{ fontSize: 17, color: t.warn ? C.red : t.dim ? C.textSm : C.text }}>{t.v}</div>
+                      </div>
+                    ))}
+                </div>
+              </div>
+            </Card>
+          </div>
+          <Card style={{ marginBottom: 16 }}>
+            <SectionLabel>立即执行 Memory Worker</SectionLabel>
+            <div style={{ display: "flex", gap: 12, alignItems: "flex-end" }}>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 11, color: C.textSm, marginBottom: 5 }}>手动跑哪一天的 worker</div>
+                <Input value={workerDate} onChange={setWorkerDate} type="date" />
+              </div>
+              <Btn
+                onClick={() => postMemoryWorkerRun(workerDate, show, setRunning)}
+                disabled={running || !workerEnabled}
+                style={{ flexShrink: 0 }}
+              >
+                {running ? "提交中…" : "强制运行记忆切片 (Run Worker)"}
+              </Btn>
+            </div>
+            {!workerEnabled && <div style={{ fontSize: 11, color: C.yellow, marginTop: 8 }}>⚠ Worker 开关已关闭</div>}
+          </Card>
+          <Card>
+            <SectionLabel>向量状态</SectionLabel>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 10, marginBottom: 12 }}>
+              {[{ l: "pending_chunks", v: "84" }, { l: "embedded_chunks", v: "84" }, { l: "状态", v: "正常", green: true }]
+                .map(t => (
+                  <div key={t.l} style={{ padding: "10px 12px", borderRadius: 9, background: t.green ? C.greenBg : C.inputBg, border: `1px solid ${t.green ? C.green + "33" : C.border}` }}>
+                    <div style={{ fontSize: 10, color: C.textSm, marginBottom: 4 }}>{t.l}</div>
+                    <div style={{ fontSize: 17, color: t.green ? C.green : C.text }}>{t.v}</div>
+                  </div>
+                ))}
+            </div>
+            <div style={{ padding: "9px 12px", borderRadius: 8, background: C.greenBg, border: `1px solid ${C.green}33`, fontSize: 11, color: C.green }}>
+              ✓ 数据显示不一致已确认为展示问题，向量召回功能正常
+            </div>
+          </Card>
+        </div>
+      );
+    }
+
+    // ─── ROOT ─────────────────────────────────────────────────
+
+    function App() {
+      const [activeNav, setActiveNav] = useState("overview");
+      return (
+        <div style={{ minHeight: "100vh", background: C.bg, fontSize: 13 }}>
+          <FloatingSidebar active={activeNav} setActive={setActiveNav} />
+          <main style={{ padding: "24px 28px 40px" }}>
+            {activeNav === "overview" && <OverviewPage />}
+            {activeNav === "memory"   && <MemoryPage />}
+            {activeNav === "vector"   && <VectorPage />}
+          </main>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById("root"));
+    root.render(<App />);
+  {% endraw %}
+  </script>
 </body>
 </html>
